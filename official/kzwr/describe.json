@@ -1,0 +1,48 @@
+{
+  "id": "kzwr",
+  "name": "酷族账号增强",
+  "version": "{{version}}",
+  "kind": "enhance",
+  "description": "读取酷族账号登录态与云端空间用量、按账号设置空间预警、清空云端回收站（支持多账号）。备份与恢复本身走 WebDAV，不需要本插件。",
+  "ui": {
+    "title": "增强功能（酷族账号）",
+    "blocks": [
+      {
+        "type": "tips",
+        "text": "备份与恢复走 WebDAV，不需要 token。这里配置酷族账号后可查看云端空间用量、设置空间预警与清理回收站；可添加多个账号。"
+      },
+      {
+        "type": "metric",
+        "label": "云端空间",
+        "value": "读取中…",
+        "action": "/space"
+      },
+      {
+        "type": "accounts",
+        "label": "酷族账号",
+        "list": "/accounts",
+        "add": "/accounts/add",
+        "update": "/accounts/update",
+        "remove": "/accounts/remove",
+        "credential_field": "token",
+        "credential_label": "access-token",
+        "credential_placeholder": "浏览器登录酷族后，F12 → Application → Cookies → www.kzwr.com → 复制 access-token",
+        "multiple": true,
+        "edit_action": "/accounts/percent",
+        "edit_field": "percent",
+        "edit_label": "空间预警阈值",
+        "edit_suffix": "%",
+        "edit_hint": "用量达到该百分比即报警；0 = 关闭该账号的预警",
+        "edit_min": 0,
+        "edit_max": 100
+      },
+      {
+        "type": "button",
+        "label": "清空云端回收站",
+        "action": "/trash/empty",
+        "danger": true,
+        "confirm": "将物理删除所有账号回收站内的文件，不可恢复"
+      }
+    ]
+  }
+}

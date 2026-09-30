@@ -1,0 +1,7 @@
+# 钉住工具链**通道**：让 CI 与本地构建可复现（避免"我这儿能编、CI 编不过"）。
+#
+# 刻意不写 `components = [...]`：那会让 rustup 在每次构建前尝试同步组件，
+# 在离线/受限环境（如 NAS）会因 `.rustup` 目录权限而失败。
+# 需要 rustfmt/clippy 时在 CI 里显式 `rustup component add`。
+[toolchain]
+channel = "stable"

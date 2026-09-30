@@ -1,0 +1,142 @@
+name: 定时同步 SDK
+
+# 从主仓库（fn-kzwr-backup）拉取最新 SDK 到此仓库。
+#
+# ## 为什么是这个方向
+#
+# SDK 目前**在主仓库开发**（`plugins/sdk/` 有完整提交历史），插件仓库只是
+# 发布者接触它的入口。所以同步方向是「主仓库 → 本仓库」，由本仓库定时拉取。
+#
+# ## 为什么用定时而不是 push 触发
+#
+# 主仓库 push 到插件仓库需要跨仓库 token（一个仓库的 GITHUB_TOKEN 不能推另一个
+# 仓库）。定时轮询无需任何跨仓库凭据 —— 只需读公开源码。代价是延迟（最长一个
+# 周期），对 SDK 这种低频变更完全够用。
+#
+# ## ⚠️ SDK 变更的连带影响（本工作流会检查）
+#
+# SDK 携带 `ABI_VERSION` 与 `repr(C)` 表布局。它一变：
+#   1. `abi-layout.txt` 必须同步更新（否则两侧 CI 会红）；
+#   2. 若是**破坏性**变更，`C_ABI_VERSION` 要 +1，此时**全部已发布插件失效**，
+#      必须与新宿主同步发版 —— 本工作流遇到这种情况会**失败并醒目提示**，
+#      而不是静默提交，避免"同步了 SDK 但索引里还是旧 ABI 插件"的错位。
+
+on:
+  schedule:
+    # 每天 03:17 UTC（避开整点，减少与其它工作流挤在一起）
+    - cron: '17 3 * * *'
+  workflow_dispatch: # 也允许手动触发（重要变更后可立即同步）
+
+permissions:
+  contents: write # 提交同步结果
+  issues: write   # ABI 升版时开 issue 提醒人工处理（缺这条 gh issue create 会 403）
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: true
+
+      # 只取主仓库的 SDK 相关文件（浅克隆，省流量）
+      - name: 拉取主仓库
+        run: |
+          git clone --depth 1 \
+            https://github.com/MianJu28/fn-kzwr-backup.git /tmp/upstream
+
+      - name: 对比 SDK
+        id: diff
+        run: |
+          set -e
+          UP=/tmp/upstream/plugins/sdk
+          changed=0
+          for f in Cargo.toml Cargo.lock src/lib.rs; do
+            if ! diff -q "$UP/$f" "sdk/$f" >/dev/null 2>&1; then
+              echo "  差异：sdk/$f"
+              changed=1
+            fi
+          done
+
+          # ABI 布局快照也要一起同步（它是两仓库的共同契约）
+          if ! diff -q /tmp/upstream/abi-layout.txt abi-layout.txt >/dev/null 2>&1; then
+            echo "  差异：abi-layout.txt"
+            changed=1
+          fi
+
+          if [ "$changed" = "0" ]; then
+            echo "SDK 已是最新，无需同步"
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=1" >> "$GITHUB_OUTPUT"
+
+          # 复制（保留主仓库内容为准）
+          cp "$UP/Cargo.toml" "$UP/Cargo.lock" sdk/
+          cp "$UP/src/lib.rs" sdk/src/lib.rs
+          cp /tmp/upstream/abi-layout.txt abi-layout.txt
+
+      # ⚠️ 关键检查：ABI 版本变了没有？
+      #    变了就意味着**已发布的全部插件都失效**（宿主对 abi 是精确相等判定），
+      #    必须人工介入（升宿主 + 重编全部插件），不能让机器人静默提交了事。
+      - name: 检查 ABI 版本变化
+        if: steps.diff.outputs.changed == '1'
+        id: abi
+        run: |
+          set -e
+          NEW=$(grep -oE 'pub const ABI_VERSION: u32 = [0-9]+' sdk/src/lib.rs | grep -oE '[0-9]+$')
+          OLD=$(git show HEAD:sdk/src/lib.rs 2>/dev/null \
+                | grep -oE 'pub const ABI_VERSION: u32 = [0-9]+' | grep -oE '[0-9]+$' || echo "$NEW")
+          echo "旧 ABI=$OLD 新 ABI=$NEW"
+          if [ "$OLD" != "$NEW" ]; then
+            echo "bumped=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "bumped=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 校验同步结果（快照与 SDK 必须一致）
+        if: steps.diff.outputs.changed == '1'
+        run: python3 Scripts/check_abi_snapshot.py abi-layout.txt sdk/src/lib.rs
+
+      # 破坏性变更：**不自动提交**，改为开 issue 要求人工处理
+      - name: ABI 升版 ⇒ 拒绝自动提交并提示
+        if: steps.abi.outputs.bumped == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEW=$(grep -oE 'pub const ABI_VERSION: u32 = [0-9]+' sdk/src/lib.rs | grep -oE '[0-9]+$')
+          gh issue create \
+            --title "⚠️ SDK 同步检测到 ABI 升版（$NEW）：需人工处理" \
+            --body "$(printf '%s\n' \
+              "定时同步发现主仓库的 SDK 更改了 \`ABI_VERSION\`（→ **$NEW**）。" \
+              "" \
+              "**本工作流已拒绝自动提交**，因为 ABI 是**精确相等**判定：" \
+              "宿主对 \`abi != C_ABI_VERSION\` 的插件一律拒绝加载，" \
+              "所以 ABI 一升，**已发布的全部插件都失效**。" \
+              "" \
+              "需要人工完成：" \
+              "1. 确认主仓库 \`backend/src/plugin/abi.rs\` 的 \`C_ABI_VERSION\` 已同步升版；" \
+              "2. 重编并重新发布**全部**插件（在发布前先处理此 issue）；" \
+              "3. 合并本仓库的 SDK 同步提交；" \
+              "4. 更新市场索引，避免用户看到无法加载的旧 ABI 插件。" \
+              "" \
+              "处理完请手动跑一次本工作流的 \`workflow_dispatch\`。" \
+            )"
+          echo "::error::ABI 升版，已开 issue 并中止自动提交（需人工处理）"
+          exit 1
+
+      - name: 提交同步结果
+        if: steps.diff.outputs.changed == '1' && steps.abi.outputs.bumped != '1'
+        run: |
+          # 提交前跑一遍闸门，避免把不一致的 SDK 推上去
+          bash Scripts/security_gate.sh >/dev/null
+          python3 Scripts/validate_describe.py >/dev/null
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add sdk/ abi-layout.txt
+          # 提交信息写成一行：多行 -m 里若出现**未缩进的空行**会截断 YAML 块标量
+          SHA=$(git -C /tmp/upstream rev-parse --short HEAD)
+          git commit -m "chore(sdk): 从主仓库同步 SDK（来源 MianJu28/fn-kzwr-backup@$SHA，ABI 未变）"
+          git push
+          echo "✅ SDK 已同步并提交"

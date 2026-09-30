@@ -1,0 +1,19 @@
+{
+  "plugins": {
+    "hello-x86_64": {
+      "arch": "x86_64",
+      "hash": "526c27f490076f04",
+      "version": "1.0.0"
+    },
+    "kzwr-x86_64": {
+      "arch": "x86_64",
+      "hash": "b54d00b9db916c2a",
+      "version": "1.0.0"
+    },
+    "localfs-x86_64": {
+      "arch": "x86_64",
+      "hash": "c01bc251da4e59c3",
+      "version": "1.0.0"
+    }
+  }
+}

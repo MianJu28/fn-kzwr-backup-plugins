@@ -1,0 +1,59 @@
+# ABI 布局快照（字段名有序列表）
+#
+# 用途：主仓库（宿主）与插件仓库（SDK）**各自**比对自身源码与这份快照。
+# 为什么需要它：两处 `#[repr(C)]` 表必须**逐字段同序同名**，否则跨 FFI 调用会
+# 跳到错误地址（编译期发现不了、运行期静默错位）。拆成两个仓库后无法在同一
+# CI 里比对，故引入本快照作为显式契约。
+#
+# 变更规则：改 ABI 表 → 同时更新本文件（两仓库同步提交）；破坏性变更还要 +1 版本。
+
+[KzwrPluginAbi]
+abi
+size
+describe_json
+available_json
+action_json
+health_json
+event_json
+free_str
+destroy
+host_bind
+
+[KzwrHostAbi]
+abi
+size
+free_str
+log
+audit
+alert
+resolve_alerts
+host_version
+now_ms
+own_data_dir
+progress
+schedule
+seal
+unseal
+
+[KzwrTargetAbi]
+abi
+size
+target_open
+target_close
+write_begin
+write_chunk
+write_end
+write_abort
+read_begin
+read_chunk
+read_end
+list_json
+delete
+ensure_dir
+ping
+test_json
+last_error_json
+plan_begin
+plan_next
+plan_end
+free_str

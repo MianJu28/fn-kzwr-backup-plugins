@@ -1,0 +1,69 @@
+name: 插件 PR 校验
+
+# ⚠️ 不要改成 `on: pull_request_target`。
+#
+# 该触发器**有仓库 Secrets 与写权限**，若再显式 checkout PR 代码并构建，
+# 等于把签名私钥交给 PR 作者（GitHub Security Lab 点名的头号 footgun）。
+#
+# 关于「PR 可以改本文件」：平台机制如此（`pull_request` 跑的是 **head 分支**里的
+# workflow，锁不住），但**不构成安全问题**：
+#   · 本文件**不引用**任何签名私钥；
+#   · 拿不到 Secrets、不能 merge、不能打 tag ⇒ 改成「永远通过」毫无收益。
+# 真正的门槛是**人工 review**，不是这个绿勾。
+
+on:
+  pull_request:
+    paths:
+      - 'official/**'
+      - 'community/**'
+      - 'examples/**'
+      - 'sdk/**'
+      - 'Scripts/**'
+      - '.github/workflows/**'
+
+# 显式最小权限（PR 只需要读代码）
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    # 固定镜像：决定产物的 glibc 基线。滚动的 ubuntu-latest 会让 glibc 随时间上涨，
+    # 某天编出的插件在旧 NAS 上 dlopen 失败。
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b695e5f04bedf7 # stable
+        with:
+          toolchain: stable
+
+      # 缓存**只恢复、不保存**：用 cache/restore 而非 cache，且本工作流**不调用**
+      # cache/save ⇒ PR 绝不写入缓存条目，无法投毒影响 release.yml。
+      #
+      # ⚠️ 不要用 `actions/cache` + `lookup-only: true` 实现只读：
+      #    官方文档明确写 "Does not change save cache behavior"，它仍会保存。
+      - uses: actions/cache/restore@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ci-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-${{ runner.os }}-cargo-
+
+      - name: 安全闸门（先于构建）
+        run: bash Scripts/security_gate.sh
+
+      # ⚠️ 这里**刻意不用** `--incremental`（与 release.yml 相反），两个原因：
+      #   1. PR 校验的职责是"证明确实能从头编过"，用增量缓存会掩盖真实失败；
+      #   2. 本工作流的缓存是**只读**的（见上一步 cache/restore），本来就写不了
+      #      构建状态 —— 复用 release 的产物会让 PR 校验失去独立性。
+      - name: 构建 + 单测（逐个插件，全量）
+        run: bash Scripts/build_all.sh --check
+
+      - name: describe.json schema 校验
+        run: python3 Scripts/validate_describe.py
+
+      - name: SDK ↔ ABI 布局快照比对
+        run: python3 Scripts/check_abi_snapshot.py abi-layout.txt sdk/src/lib.rs

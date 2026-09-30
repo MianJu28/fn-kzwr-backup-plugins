@@ -1,0 +1,9 @@
+[package]
+name = "fn-kzwr-plugin-sdk"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "酷族备份 · 外置插件稳定 C ABI SDK（零第三方依赖，宿主升级无需重编插件）"
+
+[lib]
+name = "fn_kzwr_plugin_sdk"

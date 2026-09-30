@@ -1,0 +1,28 @@
+[package]
+name = "fn-kzwr-plugin-kzwr"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "酷族备份 · 酷族网盘增强插件（多账号 / 空间用量 / 空间预警 / 回收站清理）"
+
+[lib]
+name = "fn_kzwr_plugin_kzwr"
+# 外置插件必须编译为动态库（宿主用 libloading 加载 *.so）。
+# `rlib` 只为让 `cargo test` 能跑本 crate 的单元测试（纯 cdylib 不生成测试可执行文件），
+# 对宿主的加载没有影响。
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 只依赖**稳定契约** SDK（零第三方依赖），不依赖宿主 crate
+# → 宿主升级后本插件无需重新编译（只要 ABI v1 不变）
+fn-kzwr-plugin-sdk = { path = "../../sdk" }
+serde_json = "1"
+# 自带 HTTP 客户端：插件**不能**复用宿主的 kzwr 客户端（那正是本次迁移要拆掉的东西）
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

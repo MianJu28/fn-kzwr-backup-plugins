@@ -1,0 +1,243 @@
+name: 发布插件
+
+# 仅在**打 tag** 或**维护者手动触发**时运行 —— 两者都需要仓库写权限，
+# 外部贡献者无法触发。签名私钥**只在本工作流**注入。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只构建不发布（不签名、不建 Release）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # 创建 Release / 提交索引
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            cross: ''
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            cross: gcc-aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: true # 末步要提交索引
+
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b695e5f04bedf7 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # ARM 交叉编译：ring 含 C 代码，必须给出交叉 C 工具链
+      - name: 安装 ARM 交叉工具链
+        if: matrix.cross != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross }}
+
+      - name: 配置交叉编译环境
+        if: matrix.arch == 'aarch64'
+        run: |
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+          } >> "$GITHUB_ENV"
+
+      # ⚠️ 与 ci.yml 的关键差异：这里**用 cache（可写）**且前缀是 `release-`，
+      #    与 PR 工作流的 `ci-` 前缀**完全不重叠** ⇒ 即使 PR 能写缓存也影响不到本工作流。
+      - uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ matrix.arch }}-cargo-
+
+      # 构建状态与产物缓存在 `.build-state/`（随下面的 actions/cache 一起存取），
+      # 使"同一提交重复触发"或"只改了一个插件"时不必重建全部。
+      # 增量基线（**权威**）= 仓库里的 build-state.json（上一轮发布提交回来的）。
+      # 缓存只用来加速"产物复用"：状态本身不依赖缓存，故缓存被逐出只会退化为
+      # 全量重建，**不会出错**。
+      #
+      # ⚠️ 缓存 key 含 arch 且前缀是 pluginbuild-（与 PR 工作流的 ci- 不重叠）。
+      - name: 恢复构建产物缓存（加速用，非必需）
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        with:
+          path: dist/plugins
+          key: pluginartifacts-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            pluginartifacts-${{ matrix.arch }}-
+
+      - name: 显示增量基线
+        run: |
+          if [ -f build-state.json ]; then
+            echo "已从仓库读取增量基线："
+            python3 -c "import json;d=json.load(open('build-state.json'));print('  插件数:',len(d.get('plugins',{})))"
+          else
+            echo "仓库中无 build-state.json —— 本次将全量构建"
+          fi
+
+      - name: 构建（增量：未变的插件不重复构建）
+        run: |
+          bash Scripts/build_all.sh \
+            --target "${{ matrix.target }}" \
+            --arch "${{ matrix.arch }}" \
+            --incremental
+
+      - name: 注入签名私钥（**仅此工作流**）
+        if: ${{ !inputs.dry_run }}
+        env:
+          PLUGIN_SIGN_KEY_B64: ${{ secrets.PLUGIN_SIGN_KEY_B64 }}
+        run: |
+          if [ -z "$PLUGIN_SIGN_KEY_B64" ]; then
+            echo "::error::未配置 Secrets.PLUGIN_SIGN_KEY_B64，无法签名"
+            exit 1
+          fi
+          mkdir -p .keys
+          printf '%s' "$PLUGIN_SIGN_KEY_B64" | base64 -d > .keys/sign.key
+          chmod 600 .keys/sign.key
+          # 立刻校验私钥可用，避免打包末尾才发现
+          test -n "$(bash Scripts/sign_all.sh --pubkey-only)" \
+            || { echo "::error::PLUGIN_SIGN_KEY_B64 不是有效的 Ed25519 私钥"; exit 1; }
+
+      - name: 签名 + 记录 glibc 基线（增量：已签名的跳过）
+        if: ${{ !inputs.dry_run }}
+        run: bash Scripts/sign_all.sh --sign --arch "${{ matrix.arch }}" --incremental
+
+      - name: 校验产物（每个 .so 必须有 .sig）
+        run: |
+          set -e
+          n=$(find dist/plugins -name '*.so' | wc -l)
+          echo "插件产物：$n 个"
+          test "$n" -gt 0 || { echo "::error::没有构建出任何插件"; exit 1; }
+          if [ "${{ !inputs.dry_run }}" = "true" ]; then
+            s=$(find dist/plugins -name '*.so.sig' | wc -l)
+            test "$n" -eq "$s" || { echo "::error::存在未签名的插件（会被宿主拒绝加载）"; exit 1; }
+          fi
+
+      - name: 上传产物（供 build_index 汇总）
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: plugins-${{ matrix.arch }}
+          path: |
+            dist/plugins/**
+            dist/meta/**
+            build-state.json
+          if-no-files-found: error
+
+  publish:
+    needs: release
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: true
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: dist/artifacts
+
+      - name: 汇总全部架构产物
+        run: |
+          mkdir -p dist/plugins dist/meta
+          # ⚠️ 两架构产物**同名**（都是 lib<name>.so），不能用 `cp -exec` 平铺到同一目录
+          #    —— 后一个会覆盖前一个，最终索引里只剩单架构。
+          #    各架构产物已在 build_all.sh --arch 阶段带 `-<arch>.so` 后缀，此处保留
+          #    其所在目录结构（artifact 名为 plugins-<arch>）以免混淆。
+          find dist/artifacts -name '*.so*' -exec cp -n {} dist/plugins/ \;
+          find dist/artifacts -name '*.json' -path '*meta*' -exec cp -n {} dist/meta/ \;
+          echo "汇总结果："
+          ls -1 dist/plugins | head -30
+          # 自检：确认两个架构的产物都在（少一个就是覆盖 bug 复发）
+          n_x86=$(ls dist/plugins | grep -c -- '-x86_64\.so$' || true)
+          n_arm=$(ls dist/plugins | grep -c -- '-aarch64\.so$' || true)
+          echo "x86_64 产物 $n_x86 个，aarch64 产物 $n_arm 个"
+          if [ "$n_x86" -eq 0 ] || [ "$n_arm" -eq 0 ]; then
+            echo "::error::某个架构的产物缺失（很可能又被同名覆盖了）"
+            exit 1
+          fi
+
+      - name: 合并各架构的增量状态
+        run: |
+          # 两个矩阵任务各自产出只含**自己架构**的 build-state.json。
+          # 必须合并成一份（按 pid+arch 为键），否则后一次发布会把另一架构的
+          # 记录覆盖掉，导致该架构下次**误判为未构建**而全量重编。
+          python3 - <<'PYEOF'
+          import json, glob, os
+          merged = {"plugins": {}}
+          for f in glob.glob("dist/artifacts/**/build-state.json", recursive=True):
+              try:
+                  d = json.load(open(f))
+              except Exception:
+                  continue
+              # 状态键**已经是** `{pid}-{arch}`（由 build_all.sh 写入），
+              # 这里直接沿用，不要再拼一次 arch —— 否则会出现 `kzwr-x86_64-x86_64`。
+              for key, info in d.get("plugins", {}).items():
+                  if not info.get("arch"):
+                      continue
+                  merged["plugins"][key] = info
+          # 若仓库已有基线，把它也并进来（保留本次未构建的架构/插件记录）
+          if os.path.isfile("build-state.json"):
+              try:
+                  prev = json.load(open("build-state.json"))
+                  for k, v in prev.get("plugins", {}).items():
+                      merged["plugins"].setdefault(k, v)
+              except Exception:
+                  pass
+          json.dump(merged, open("build-state.json", "w"), ensure_ascii=False, indent=2, sort_keys=True)
+          print("合并后状态条目：", len(merged["plugins"]))
+          for k, v in sorted(merged["plugins"].items()):
+              print(f"  {k:<28} {v['hash']}  v{v.get('version')}")
+          PYEOF
+
+      - name: 生成索引
+        run: python3 Scripts/build_index.py --dist dist --out index.json
+
+      - name: 注入签名私钥（索引与插件用同一把官方密钥）
+        env:
+          PLUGIN_SIGN_KEY_B64: ${{ secrets.PLUGIN_SIGN_KEY_B64 }}
+        run: |
+          mkdir -p .keys
+          printf '%s' "$PLUGIN_SIGN_KEY_B64" | base64 -d > .keys/sign.key
+          chmod 600 .keys/sign.key
+
+      - name: 签名索引
+        run: bash Scripts/sign_index.sh index.json
+
+      - name: 创建 Release（上传 .so/.sig/索引）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "插件发布 ${{ github.ref_name }}（索引版本见 index.json 的 catalog_version）" \
+            dist/plugins/*.so dist/plugins/*.so.sig index.json index.json.sig
+
+      - name: 提交索引与增量状态回仓库
+        run: |
+          # 提交两样东西：
+          #   index.json/.sig  —— 供市场 raw 直取（与 Release 资产互为冗余）
+          #   build-state.json —— 下次构建的**增量基线**（权威来源，缓存仅加速）
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add index.json index.json.sig build-state.json
+          if git diff --cached --quiet; then
+            echo "索引与状态均无变化，跳过提交"
+          else
+            git commit -m "chore: 更新索引与增量状态（${{ github.ref_name }}）"
+            git push
+          fi
