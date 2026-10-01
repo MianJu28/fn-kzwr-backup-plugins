@@ -1,13 +1,28 @@
 {
   "plugins": {
+    "hello-aarch64": {
+      "arch": "aarch64",
+      "hash": "14fca5658e28f9fe",
+      "version": "1.0.0"
+    },
     "hello-x86_64": {
       "arch": "x86_64",
       "hash": "526c27f490076f04",
       "version": "1.0.0"
     },
+    "kzwr-aarch64": {
+      "arch": "aarch64",
+      "hash": "cee89f6bc75841bc",
+      "version": "1.0.0"
+    },
     "kzwr-x86_64": {
       "arch": "x86_64",
       "hash": "b54d00b9db916c2a",
+      "version": "1.0.0"
+    },
+    "localfs-aarch64": {
+      "arch": "aarch64",
+      "hash": "defc535e1b470d3d",
       "version": "1.0.0"
     },
     "localfs-x86_64": {

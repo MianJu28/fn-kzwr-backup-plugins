@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "catalog_version": 1,
+  "generated_at": "2026-10-01T17:02:01Z",
+  "commit": "a0b9cc4",
+  "host_abi": 2,
+  "plugins": [
+    {
+      "id": "kzwr",
+      "name": "酷族账号增强",
+      "description": "读取酷族账号登录态与云端空间用量、按账号设置空间预警、清空云端回收站（支持多账号）。备份与恢复本身走 WebDAV，不需要本插件。",
+      "homepage": "",
+      "license": "",
+      "publisher": "",
+      "reviewed_by": "",
+      "origin": "official",
+      "kind": "enhance",
+      "tags": [],
+      "versions": [
+        {
+          "version": "1.0.0",
+          "released_at": "2026-10-01T17:02:01Z",
+          "file_name": "libfn_kzwr_plugin_kzwr-aarch64.so",
+          "url": "https://github.com/MianJu28/fn-kzwr-backup-plugins/releases/download/v0.1.0/libfn_kzwr_plugin_kzwr-aarch64.so",
+          "sig_url": "https://github.com/MianJu28/fn-kzwr-backup-plugins/releases/download/v0.1.0/libfn_kzwr_plugin_kzwr-aarch64.so.sig",
+          "sha256_so": "1f0128416dfaa38afcce657f61795d6af48b9e611face0c043515ed620c9a11d",
+          "sha256_sig": "03b42fc80c683b4cbcec294e7277b5e02524d2bf3413fa17f876b65d31d93ec7",
+          "size_bytes": 3897328,
+          "abi": 2,
+          "arch": "aarch64",
+          "glibc_min": "2.34",
+          "min_host_version": "",
+          "source_commit": "a0b9cc4",
+          "yanked": false
+        },
+        {
+          "version": "1.0.0",
+          "released_at": "2026-10-01T17:02:01Z",
+          "file_name": "libfn_kzwr_plugin_kzwr-x86_64.so",
+          "url": "https://github.com/MianJu28/fn-kzwr-backup-plugins/releases/download/v0.1.0/libfn_kzwr_plugin_kzwr-x86_64.so",
+          "sig_url": "https://github.com/MianJu28/fn-kzwr-backup-plugins/releases/download/v0.1.0/libfn_kzwr_plugin_kzwr-x86_64.so.sig",
+          "sha256_so": "c7d8f69f2a30251104403742ffff1366b4ca4cbc4bb8b5b1658d62df60334863",
+          "sha256_sig": "f68be7b275eaf032c013cf46cbce309dfbd6d1dcd4c4d8c6a0ec1a5c39d17849",
+          "size_bytes": 4410496,
+          "abi": 2,
+          "arch": "x86_64",
+          "glibc_min": "2.34",
+          "min_host_version": "",
+          "source_commit": "a0b9cc4",
+          "yanked": false
+        }
+      ]
+    }
+  ],
+  "revoked": []
+}
