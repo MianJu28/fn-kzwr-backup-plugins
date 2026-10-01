@@ -1,0 +1,659 @@
+//! 酷族备份 · 外置插件 —— **联通云盘（沃云盘）备份目标**
+//!
+//! 采用 **H5 端协议**（`LoginByMobileV2`），不实现 Web / PC 等其他端。
+//! H5 渠道 token 有效期更长（实测约 60 天，Web 端约 7 天）。
+//!
+//! ## 状态说明（重要）
+//!
+//! **上传能力尚未实现** —— 联通云盘的上传接口资料缺失（现有协议库只覆盖下载/列举/
+//! 建目录/删除）。因此本插件目前可：列举、下载（恢复）、删除、建目录、连通性测试；
+//! 但**新建备份（写入）会明确报错**，绝不静默吞掉数据。
+//!
+//! ## 凭据
+//!
+//! - `username` → 手机号
+//! - `password` → H5 access_token（同时是 wohome 通道的加密密钥，等同数据密钥）
+//!
+//! 令牌可用插件页的「发送短信验证码」+「用验证码登录」动作获取。
+//!
+//! ## 安全
+//!
+//! - 插件只接触 **age 密文**，明文与密钥永不离开宿主
+//! - token 只留在内存，不写日志、不落盘
+//! - 所有 FFI 入口用 guard 闭包包裹，panic 绝不跨越 FFI
+
+pub mod instance;
+pub mod protocol;
+
+use instance::{join_remote, parse_target, ReadH, Wopan, WriteH};
+use protocol::Channel;
+use serde_json::{json, Value};
+use std::ffi::c_void;
+use std::os::raw::c_char;
+
+use fn_kzwr_plugin_sdk as sdk;
+
+// ════════════════════════════════════════════════════════════════════════════
+// panic 兜底：**绝不让 panic 跨越 FFI 边界**
+// ════════════════════════════════════════════════════════════════════════════
+
+fn guard_str(f: impl FnOnce() -> String) -> *mut c_char {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(s) => sdk::to_c_string(s),
+        Err(_) => sdk::to_c_string(sdk::json::error("插件内部错误（panic 已拦截）")),
+    }
+}
+
+fn guard_ptr(f: impl FnOnce() -> Option<*mut c_void>) -> *mut c_void {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .ok()
+        .flatten()
+        .unwrap_or(std::ptr::null_mut())
+}
+
+fn guard_i32(f: impl FnOnce() -> i32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(-1)
+}
+
+#[allow(dead_code)] // write_end 目前返回固定错误码；保留以便上传实现后直接复用
+fn guard_i64(f: impl FnOnce() -> i64) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(-1)
+}
+
+/// 命令字
+mod cmd {
+    pub const QUERY_USER: &str = "AppQueryUser";
+    pub const QUERY_ALL_FILES: &str = "QueryAllFiles";
+    pub const CREATE_DIRECTORY: &str = "CreateDirectory";
+    pub const DELETE_FILE: &str = "DeleteFile";
+    pub const GET_DOWNLOAD_URL: &str = "GetDownloadUrl";
+    pub const LOGIN_SMS_V2: &str = "LoginByMobileV2";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 目标能力表：生命周期
+// ════════════════════════════════════════════════════════════════════════════
+
+extern "C" fn target_open(raw: *const c_char) -> *mut c_void {
+    guard_ptr(|| {
+        let s = unsafe { sdk::from_c_str(raw) };
+        match parse_target(&s) {
+            Ok(inst) => Some(Box::into_raw(Box::new(inst)) as *mut c_void),
+            Err(_) => None,
+        }
+    })
+}
+
+extern "C" fn target_close(th: *mut c_void) {
+    if !th.is_null() {
+        unsafe {
+            drop(Box::from_raw(th as *mut Wopan));
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 写入（上传）
+//
+// ⚠️ **尚未实现**：联通云盘上传接口资料缺失。
+//    这里刻意**明确失败**而非静默吞数据 —— 静默成功会让备份"看起来好了"
+//    但云端其实没有数据，是最危险的失败模式。
+// ════════════════════════════════════════════════════════════════════════════
+
+extern "C" fn write_begin(th: *mut c_void, rel: *const c_char, total: u64) -> *mut c_void {
+    guard_ptr(|| {
+        if th.is_null() {
+            return None;
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        let rel_s = unsafe { sdk::from_c_str(rel) };
+        inst.err(format!(
+            "上传未实现：联通云盘上传接口资料缺失，无法写入 {rel_s}（{total} 字节）"
+        ));
+        None
+    })
+}
+
+extern "C" fn write_chunk(
+    _th: *mut c_void,
+    _h: *mut c_void,
+    _buf: *const u8,
+    _len: u32,
+) -> i32 {
+    -1
+}
+
+extern "C" fn write_end(_th: *mut c_void, _h: *mut c_void) -> i64 {
+    -1
+}
+
+extern "C" fn write_abort(_th: *mut c_void, h: *mut c_void) {
+    if !h.is_null() {
+        unsafe {
+            drop(Box::from_raw(h as *mut WriteH));
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 读取（下载 → 恢复）
+// ════════════════════════════════════════════════════════════════════════════
+
+extern "C" fn read_begin(th: *mut c_void, rel: *const c_char) -> *mut c_void {
+    guard_ptr(|| {
+        if th.is_null() {
+            return None;
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        let rel_s = unsafe { sdk::from_c_str(rel) };
+        let remote = join_remote(&inst.root, &rel_s)?;
+        // 1) 取 fid（列表接口的 id 与 fid 语义不同；GetDownloadUrl 必须传 fid）
+        let fid = find_fid(inst, &remote)?;
+        // 2) 换直链  3) 用干净连接下载（带自定义头访问 CDN 会 SSL 错误）
+        let url = download_url(inst, &fid).map_err(|e| inst.err(format!("下载直链获取失败: {e}"))).ok()?;
+        let bytes = reqwest::blocking::Client::new()
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .send()
+            .ok()?
+            .bytes()
+            .ok()?
+            .to_vec();
+        Some(Box::into_raw(Box::new(ReadH { data: bytes, pos: 0 })) as *mut c_void)
+    })
+}
+
+extern "C" fn read_chunk(
+    _th: *mut c_void,
+    h: *mut c_void,
+    buf: *mut u8,
+    len: u32,
+) -> i32 {
+    guard_i32(|| {
+        if h.is_null() || buf.is_null() || len == 0 {
+            return 0;
+        }
+        let rh = unsafe { &mut *(h as *mut ReadH) };
+        if rh.pos >= rh.data.len() {
+            return 0; // EOF
+        }
+        let n = (len as usize).min(rh.data.len() - rh.pos);
+        unsafe {
+            std::ptr::copy_nonoverlapping(rh.data.as_ptr().add(rh.pos), buf, n);
+        }
+        rh.pos += n;
+        n as i32
+    })
+}
+
+extern "C" fn read_end(_th: *mut c_void, h: *mut c_void) -> i32 {
+    if !h.is_null() {
+        unsafe {
+            drop(Box::from_raw(h as *mut ReadH));
+        }
+    }
+    0
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 列举 / 删除 / 目录 / 连通性
+// ════════════════════════════════════════════════════════════════════════════
+
+extern "C" fn list_json(th: *mut c_void, prefix: *const c_char) -> *mut c_char {
+    guard_str(|| {
+        if th.is_null() {
+            return "[]".to_string();
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        let pfx = unsafe { sdk::from_c_str(prefix) };
+        match list_files(inst, &pfx) {
+            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string()),
+            Err(e) => {
+                inst.err(format!("列举失败: {e}"));
+                "[]".to_string()
+            }
+        }
+    })
+}
+
+extern "C" fn delete(th: *mut c_void, rel: *const c_char) -> i32 {
+    guard_i32(|| {
+        if th.is_null() {
+            return -1;
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        let rel_s = unsafe { sdk::from_c_str(rel) };
+        // 闭包返回 i32，不能用 `?`；越权路径按失败处理
+        let remote = match join_remote(&inst.root, &rel_s) {
+            Some(r) => r,
+            None => return -1,
+        };
+        let fid = match find_fid(inst, &remote) {
+            Some(f) => f,
+            None => return -1,
+        };
+        match inst.dispatch(
+            cmd::DELETE_FILE,
+            json!({ "fileList": [fid], "dirList": [], "spaceType": inst.space_type }),
+            Channel::WoHome,
+        ) {
+            Ok(_) => 0,
+            Err(e) => {
+                inst.err(format!("删除失败: {e}"));
+                -1
+            }
+        }
+    })
+}
+
+extern "C" fn ensure_dir(th: *mut c_void, rel: *const c_char) -> i32 {
+    guard_i32(|| {
+        if th.is_null() {
+            return -1;
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        let rel_s = unsafe { sdk::from_c_str(rel) };
+        let remote = match join_remote(&inst.root, &rel_s) {
+            Some(r) => r,
+            None => return -1,
+        };
+        // 云盘接口一次只能建一层，故逐层创建
+        let mut cur = String::new();
+        for seg in remote.split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            if !cur.is_empty() {
+                cur.push('/');
+            }
+            cur.push_str(seg);
+            if find_fid(inst, &cur).is_some() {
+                continue;
+            }
+            let parent_id = match cur.rfind('/') {
+                Some(i) => find_fid(inst, &cur[..i]).unwrap_or_else(|| "0".to_string()),
+                None => "0".to_string(),
+            };
+            if inst
+                .dispatch(
+                    cmd::CREATE_DIRECTORY,
+                    json!({
+                        "directoryName": seg,
+                        "parentDirectoryId": parent_id,
+                        "familyId": "0",
+                        "spaceType": inst.space_type,
+                    }),
+                    Channel::WoHome,
+                )
+                .is_err()
+            {
+                return -1;
+            }
+        }
+        0
+    })
+}
+
+extern "C" fn ping(th: *mut c_void) -> i32 {
+    guard_i32(|| {
+        if th.is_null() {
+            return -1;
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        match inst.dispatch(cmd::QUERY_USER, json!({ "accessToken": inst.token }), Channel::ApiUser) {
+            Ok(_) => 0,
+            Err(e) => {
+                inst.err(format!("连通性测试失败: {e}"));
+                -1
+            }
+        }
+    })
+}
+
+extern "C" fn test_json(raw: *const c_char) -> *mut c_char {
+    guard_str(|| {
+        let s = unsafe { sdk::from_c_str(raw) };
+        match parse_target(&s) {
+            Err(e) => json!({ "ok": false, "error": e }).to_string(),
+            Ok(inst) => match inst.dispatch(
+                cmd::QUERY_USER,
+                json!({ "accessToken": inst.token }),
+                Channel::ApiUser,
+            ) {
+                // 只回显是否连通，**不回显 token 或用户信息**（防敏感外泄）
+                Ok(_) => json!({ "ok": true, "error": "" }).to_string(),
+                Err(e) => json!({ "ok": false, "error": e }).to_string(),
+            },
+        }
+    })
+}
+
+extern "C" fn last_error_json(th: *mut c_void) -> *mut c_char {
+    guard_str(|| {
+        if th.is_null() {
+            return json!({ "error": "" }).to_string();
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        let e = inst.last_error.lock().map(|g| g.clone()).unwrap_or_default();
+        json!({ "error": e }).to_string()
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 云盘操作辅助
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 列举某目录下的条目（宿主期望 `[{rel_path,size,mtime_secs,is_dir}]`）
+fn list_files(inst: &Wopan, prefix: &str) -> Result<Vec<Value>, String> {
+    let dir_id = if prefix.is_empty() {
+        "0".to_string()
+    } else {
+        find_fid(inst, &join_remote(&inst.root, prefix).unwrap_or_default())
+            .unwrap_or_else(|| "0".to_string())
+    };
+    let data = inst.dispatch(
+        cmd::QUERY_ALL_FILES,
+        json!({ "directoryId": dir_id, "spaceType": inst.space_type, "pageNum": 1, "pageSize": 1000 }),
+        Channel::WoHome,
+    )?;
+    let items = data
+        .get("fileList")
+        .or_else(|| data.get("files"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for it in items {
+        let name = it
+            .get("fileName")
+            .or_else(|| it.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let is_dir = it
+            .get("fileType")
+            .and_then(|t| t.as_str())
+            .map(|t| t == "0" || t.eq_ignore_ascii_case("directory") || t.eq_ignore_ascii_case("folder"))
+            .unwrap_or(false);
+        let size = it
+            .get("fileSize")
+            .or_else(|| it.get("size"))
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
+        let mtime = it
+            .get("createTime")
+            .or_else(|| it.get("updateTime"))
+            .and_then(|t| t.as_str())
+            .and_then(parse_time)
+            .unwrap_or(0);
+        out.push(json!({
+            "rel_path": join_remote(prefix, name).unwrap_or_else(|| name.to_string()),
+            "size": size,
+            "mtime_secs": mtime,
+            "is_dir": is_dir,
+        }));
+    }
+    Ok(out)
+}
+
+/// 按云盘内路径找节点的 **`fid`**（不是 `id`！误传 id 会得到 9999）
+fn find_fid(inst: &Wopan, remote: &str) -> Option<String> {
+    let (parent, name) = match remote.rfind('/') {
+        Some(i) => (&remote[..i], &remote[i + 1..]),
+        None => ("", remote),
+    };
+    if name.is_empty() {
+        return Some("0".to_string()); // 根
+    }
+    let parent_id = if parent.is_empty() {
+        "0".to_string()
+    } else {
+        find_fid(inst, parent)?
+    };
+    let data = inst
+        .dispatch(
+            cmd::QUERY_ALL_FILES,
+            json!({ "directoryId": parent_id, "spaceType": inst.space_type, "pageNum": 1, "pageSize": 1000 }),
+            Channel::WoHome,
+        )
+        .ok()?;
+    let items = data.get("fileList").or_else(|| data.get("files")).and_then(|v| v.as_array())?;
+    for it in items {
+        let n = it.get("fileName").or_else(|| it.get("name")).and_then(|x| x.as_str()).unwrap_or("");
+        if n == name {
+            return it
+                .get("fid")
+                .or_else(|| it.get("fileId"))
+                .and_then(|f| f.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// 取下载直链（必须传 fid）
+fn download_url(inst: &Wopan, fid: &str) -> Result<String, String> {
+    let data = inst.dispatch(
+        cmd::GET_DOWNLOAD_URL,
+        json!({ "fidList": [fid], "spaceType": inst.space_type }),
+        Channel::WoHome,
+    )?;
+    let arr = data.as_array().cloned().unwrap_or_else(|| {
+        data.get("downloadList")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    });
+    arr.first()
+        .and_then(|x| x.get("downloadUrl").or_else(|| x.get("url")))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "响应中没有下载直链".to_string())
+}
+
+/// 时间串 → 秒（兼容毫秒数字串与 `YYYY-MM-DD …`）
+fn parse_time(s: &str) -> Option<u64> {
+    if let Ok(ms) = s.parse::<i64>() {
+        return Some(if ms > 1_000_000_000_000 { ms / 1000 } else { ms } as u64);
+    }
+    let d: Vec<&str> = s.split(' ').next()?.split('-').collect();
+    if d.len() != 3 {
+        return None;
+    }
+    let (y, m, day): (i64, i64, i64) = (d[0].parse().ok()?, d[1].parse().ok()?, d[2].parse().ok()?);
+    // 简化换算（不处理时区；仅用于 mtime 比较/排序）
+    let days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400 + (m - 1) * 30 + day;
+    Some((days * 86400) as u64)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 主表：元信息 / 动作 / 体检
+// ════════════════════════════════════════════════════════════════════════════
+
+extern "C" fn describe() -> *mut c_char {
+    guard_str(|| include_str!("../describe.json").to_string())
+}
+
+extern "C" fn available(_cfg: *const c_char) -> *mut c_char {
+    guard_str(|| json!({ "available": true, "reason": null }).to_string())
+}
+
+extern "C" fn action(action: *const c_char, request: *const c_char) -> *mut c_char {
+    let action = unsafe { sdk::from_c_str(action) };
+    let request = unsafe { sdk::from_c_str(request) };
+    guard_str(move || match action.as_str() {
+        "/sms/send" => sms_send(&request),
+        "/sms/login" => sms_login(&request),
+        other => sdk::json::error(&format!("未知动作：{other}")),
+    })
+}
+
+/// 发送短信验证码（独立端点，不走 dispatcher）
+fn sms_send(request: &str) -> String {
+    let v: Value = match serde_json::from_str(request) {
+        Ok(v) => v,
+        Err(_) => return sdk::json::error("请求不是合法 JSON"),
+    };
+    let phone = v
+        .get("body")
+        .and_then(|b| b.get("phone"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .trim();
+    if phone.is_empty() {
+        return sdk::json::error("缺少手机号");
+    }
+    let payload = json!({ "operateType": "1", "phone": phone, "uuid": protocol::js_uuid(), "verifyCode": "" });
+    let param = match protocol::encrypt(&payload.to_string(), protocol::H5_DEFAULT_SECRET_KEY) {
+        Ok(p) => p,
+        Err(e) => return sdk::json::error(&format!("加密失败: {e}")),
+    };
+    let body = json!({ "func": "pc_send", "clientId": protocol::H5_CLIENT_ID, "param": param });
+    let url = format!("{}{}", protocol::BASE_URL, "/api-user/sendMessageCodeBase");
+    match reqwest::blocking::Client::new().post(&url).json(&body).send() {
+        Ok(r) => match r.json::<Value>() {
+            Ok(resp) => {
+                let rsp = resp.get("RSP").cloned().unwrap_or(Value::Null);
+                let code = rsp.get("RSP_CODE").and_then(|c| c.as_str()).unwrap_or("");
+                if code == protocol::code::OK {
+                    sdk::json::ok_message("验证码已发送，请查收短信")
+                } else {
+                    let desc = rsp.get("RSP_DESC").and_then(|d| d.as_str()).unwrap_or("");
+                    sdk::json::error(&format!("发送失败（{code}）：{desc}"))
+                }
+            }
+            Err(e) => sdk::json::error(&format!("响应解析失败: {e}")),
+        },
+        Err(e) => sdk::json::error(&format!("请求失败: {e}")),
+    }
+}
+
+/// 用短信验证码登录（H5 渠道）→ 返回 access_token
+///
+/// ⚠️ token 会显示在界面上供用户填入目标配置（必要代价）；**插件自身不保存它**。
+fn sms_login(request: &str) -> String {
+    let v: Value = match serde_json::from_str(request) {
+        Ok(v) => v,
+        Err(_) => return sdk::json::error("请求不是合法 JSON"),
+    };
+    let body = v.get("body").cloned().unwrap_or(Value::Null);
+    let phone = body.get("phone").and_then(|p| p.as_str()).unwrap_or("").trim();
+    let code = body
+        .get("sms_code")
+        .or_else(|| body.get("code"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .trim();
+    if phone.is_empty() || code.is_empty() {
+        return sdk::json::error("缺少手机号或短信验证码");
+    }
+    let key = protocol::h5_secret(protocol::H5_CLIENT_ID);
+    let payload = json!({ "phone": phone, "smsCode": code, "clientSecret": key });
+    let res_time = instance::now_ms();
+    let req_seq = 100000 + (res_time % 89999) as i64;
+    let envelope = match protocol::build_envelope(
+        cmd::LOGIN_SMS_V2,
+        &payload,
+        Some(protocol::H5_CLIENT_ID),
+        key,
+        Channel::ApiUser.as_str(),
+        res_time,
+        req_seq,
+    ) {
+        Ok(e) => e,
+        Err(e) => return sdk::json::error(&format!("构造请求失败: {e}")),
+    };
+    let url = format!("{}{}", protocol::BASE_URL, Channel::ApiUser.path());
+    match reqwest::blocking::Client::new().post(&url).json(&envelope).send() {
+        Ok(r) => match r.json::<Value>() {
+            Ok(resp) => {
+                let rsp = resp.get("RSP").cloned().unwrap_or(Value::Null);
+                let rc = rsp.get("RSP_CODE").and_then(|c| c.as_str()).unwrap_or("");
+                if rc != protocol::code::OK {
+                    let desc = rsp.get("RSP_DESC").and_then(|d| d.as_str()).unwrap_or("");
+                    return sdk::json::error(&format!("登录失败（{rc}）：{desc}"));
+                }
+                let token = rsp
+                    .get("DATA")
+                    .and_then(|d| d.as_str())
+                    .and_then(|c| protocol::decrypt(c, key).ok())
+                    .and_then(|plain| serde_json::from_str::<Value>(&plain).ok())
+                    .and_then(|d| {
+                        d.get("access_token")
+                            .or_else(|| d.get("accessToken"))
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    });
+                match token {
+                    Some(t) if !t.is_empty() => json!({ "success": true, "token": t }).to_string(),
+                    _ => sdk::json::error("登录成功但未取得 access_token"),
+                }
+            }
+            Err(e) => sdk::json::error(&format!("响应解析失败: {e}")),
+        },
+        Err(e) => sdk::json::error(&format!("请求失败: {e}")),
+    }
+}
+
+extern "C" fn health(_cfg: *const c_char) -> *mut c_char {
+    guard_str(|| {
+        json!([{
+            "key": "wopan_target",
+            "title": "联通云盘（沃云盘）备份目标",
+            "status": "warn",
+            "detail": "目标能力表已加载（fn_kzwr_plugin_target_v1）；H5 端协议。上传能力尚未实现，当前可用于列举/恢复/删除。",
+            "hint": "上传接口资料确认后将补齐写入能力"
+        }])
+        .to_string()
+    })
+}
+
+// 导出两张表：主表（元信息/UI/动作）+ 目标表（传输能力）
+sdk::export_plugin_v1!(describe, available, action, health);
+
+sdk::export_target_v1!(
+    target_open,
+    Some(target_close),
+    write_begin,
+    write_chunk,
+    write_end,
+    Some(write_abort),
+    read_begin,
+    read_chunk,
+    Some(read_end),
+    list_json,
+    delete,
+    Some(ensure_dir),
+    Some(ping),
+    Some(test_json),
+    Some(last_error_json),
+    None, // plan_begin
+    None, // plan_next
+    None, // plan_end
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_is_valid_json() {
+        let v: Value = serde_json::from_str(include_str!("../describe.json")).expect("describe.json 必须合法");
+        assert_eq!(v["id"], "wopan");
+        assert_eq!(v["kind"], "target");
+        assert_eq!(v["runtime"]["target"], "fn_kzwr_plugin_target_v1");
+    }
+
+    /// 上传未实现时必须返回 NULL（宿主据此报错），绝不能给假句柄
+    #[test]
+    fn write_is_explicitly_unsupported() {
+        assert!(write_begin(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
+    }
+
+    #[test]
+    fn null_handle_is_safe() {
+        assert_eq!(read_chunk(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+    }
+}

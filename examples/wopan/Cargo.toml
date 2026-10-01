@@ -1,0 +1,32 @@
+[package]
+name = "fn-kzwr-plugin-wopan"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "酷族备份 · 外置插件：联通云盘（沃云盘）备份目标（H5 端协议）"
+
+[lib]
+name = "fn_kzwr_plugin_wopan"
+# 外置插件必须编译为动态库（宿主用 libloading 加载 *.so）
+crate-type = ["cdylib"]
+
+[dependencies]
+# 只依赖**稳定契约** SDK（零第三方依赖），不依赖宿主 crate
+# → 宿主升级后本插件无需重新编译（只要 ABI 不变）
+fn-kzwr-plugin-sdk = { path = "../../sdk" }
+serde_json = "1"
+
+# 网络：宿主能力表**不提供 HTTP**，插件需自带客户端。
+# 联通云盘接口是 HTTPS + AES 信封，必须联网才能工作。
+#
+# 依赖说明（供 reviewer）：
+#   - reqwest blocking + rustls：只用其 HTTPS 客户端能力，不启用任何脚本/构建期行为；
+#     `rustls` 而非 `native-tls`，避免链接 openssl（交叉编译与 NAS 环境更省心）。
+#   - aes / cbc / md-5：协议要求 AES-128-CBC(PKCS7) 与 MD5 签名，纯 Rust 实现。
+#     cbc 自带 PKCS7 填充，不需要额外 padding crate。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+md-5 = "0.10"
+base64 = "0.22"
+hex = "0.4"
