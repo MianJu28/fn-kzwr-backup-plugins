@@ -496,24 +496,13 @@ fn list_files(inst: &Wopan, prefix: &str) -> Result<Vec<Value>, String> {
         .unwrap_or_default();
     let mut out = Vec::new();
     for it in items {
-        let name = it
-            .get("fileName")
-            .or_else(|| it.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("");
+        let name = it.get("name").and_then(|n| n.as_str()).unwrap_or("");
         if name.is_empty() {
             continue;
         }
-        let is_dir = it
-            .get("fileType")
-            .and_then(|t| t.as_str())
-            .map(|t| t == "0" || t.eq_ignore_ascii_case("directory") || t.eq_ignore_ascii_case("folder"))
-            .unwrap_or(false);
-        let size = it
-            .get("fileSize")
-            .or_else(|| it.get("size"))
-            .and_then(|s| s.as_u64())
-            .unwrap_or(0);
+        // 真实响应：`type` 0=目录 1=文件（`fileType` 是扩展名分类，目录为空串）
+        let is_dir = it.get("type").and_then(|t| t.as_i64()).map(|t| t == 0).unwrap_or(false);
+        let size = it.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
         let mtime = it
             .get("createTime")
             .or_else(|| it.get("updateTime"))
@@ -555,15 +544,12 @@ fn find_dir_id(inst: &Wopan, remote: &str) -> Option<String> {
         None => ("", remote),
     };
     for it in items {
-        let n = it.get("fileName").or_else(|| it.get("name")).and_then(|x| x.as_str()).unwrap_or("");
+        let n = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
         if n != name {
             continue;
         }
-        let is_dir = it
-            .get("fileType")
-            .and_then(|t| t.as_str())
-            .map(|t| t == "0" || t.eq_ignore_ascii_case("directory") || t.eq_ignore_ascii_case("folder"))
-            .unwrap_or(false);
+        // 真实响应：`type` 0=目录 1=文件（`fileType` 是扩展名分类，目录为空串）
+        let is_dir = it.get("type").and_then(|t| t.as_i64()).map(|t| t == 0).unwrap_or(false);
         if is_dir {
             return it.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
         }
@@ -642,13 +628,7 @@ fn list_entries(inst: &Wopan, remote: &str) -> Option<Vec<Value>> {
     let items = parent_entries(inst, remote)?;
     let matched: Vec<Value> = items
         .into_iter()
-        .filter(|it| {
-            it.get("fileName")
-                .or_else(|| it.get("name"))
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                == name
-        })
+        .filter(|it| it.get("name").and_then(|x| x.as_str()).unwrap_or("") == name)
         .collect();
     Some(matched)
 }
@@ -676,7 +656,7 @@ fn find_fid(inst: &Wopan, remote: &str) -> Option<String> {
         .ok()?;
     let items = data.get("fileList").or_else(|| data.get("files")).and_then(|v| v.as_array())?;
     for it in items {
-        let n = it.get("fileName").or_else(|| it.get("name")).and_then(|x| x.as_str()).unwrap_or("");
+        let n = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
         if n == name {
             return it
                 .get("fid")
@@ -937,6 +917,93 @@ mod tests {
     /// 诊断：wohome 通道逐一试探命令字 + 三种 clientId 摆放
     #[test]
     #[ignore]
+    /// 真实上传往返：建目录 → 上传 → 校验云端大小 → 下载比对 → 删除
+    ///
+    /// ⚠️ 会真实写入账号（写在 `_kzwr_e2e/`），跑完自行清理。
+    #[test]
+    #[ignore]
+    fn live_upload_roundtrip() {
+        let inst = match live_instance() {
+            Some(i) => i,
+            None => {
+                println!("跳过：未设 WOPAN_TOKEN");
+                return;
+            }
+        };
+        // 用 9MB 以上触发分片（8MB 步长）才算真的测到分片逻辑
+        let payload = vec![b'K'; 12_000_000];
+        println!("准备上传 {} 字节（应分 2 片：8MB + 余量）", payload.len());
+
+        let dir = "_kzwr_e2e";
+        let th = Box::into_raw(Box::new(inst)) as *mut std::ffi::c_void;
+        let rel = format!("{dir}/rt.bin");
+        let rel_c = std::ffi::CString::new(rel.clone()).unwrap();
+
+        // write_begin → write_chunk → write_end（走宿主同款路径）
+        let h = write_begin(th, rel_c.as_ptr(), payload.len() as u64);
+        assert!(!h.is_null(), "write_begin 返回 NULL：{}", unsafe {
+            sdk::from_c_str(last_error_json(th))
+        });
+        // 分多次喂，模拟宿主分块推送
+        let mut off = 0usize;
+        while off < payload.len() {
+            let n = 1_048_576.min(payload.len() - off); // 每次 1MB
+            let r = write_chunk(th, h, payload[off..].as_ptr(), n as u32);
+            assert!(r > 0, "write_chunk 失败");
+            off += n;
+        }
+        let total = write_end(th, h);
+        assert!(total == payload.len() as i64, "write_end={total} 期望 {}", payload.len());
+        println!("[1] 上传完成：{total} 字节");
+
+        let inst_ref = unsafe { &*(th as *const Wopan) };
+
+        // 校验云端大小：用 Range 只取 1 字节读 Content-Range
+        let fid = find_fid(inst_ref, &rel).expect("取 fid");
+        let url = download_url(inst_ref, &fid).expect("取直链");
+        let resp = reqwest::blocking::Client::new()
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Range", "bytes=0-0")
+            .send()
+            .expect("Range 请求");
+        let cr = resp
+            .headers()
+            .get("Content-Range")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        println!("[2] Content-Range = {cr}");
+        assert!(
+            cr.contains(&format!("/{}", payload.len())),
+            "❌ 云端大小不符（可能被静默截断）: {cr}"
+        );
+
+        // 下载全文比对长度（内容一致性）
+        let bytes = reqwest::blocking::Client::new()
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .send()
+            .expect("下载")
+            .bytes()
+            .expect("读取")
+            .to_vec();
+        assert_eq!(bytes.len(), payload.len(), "下载长度不符");
+        assert!(bytes == payload, "下载内容与上传不一致");
+        println!("[3] 下载比对一致（{} 字节）", bytes.len());
+
+        // 清理
+        let id = find_id(inst_ref, &rel).expect("取 id");
+        inst_ref
+            .dispatch(
+                cmd::DELETE_FILE,
+                json!({"fileList":[id],"dirList":[],"spaceType": inst_ref.space_type}),
+                Channel::WoHome,
+            )
+            .expect("删除");
+        println!("[4] 已清理测试文件");
+    }
+
     fn live_diag() {
         let inst = match live_instance() {
             Some(i) => i,
