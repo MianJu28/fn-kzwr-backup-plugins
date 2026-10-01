@@ -159,6 +159,55 @@ impl Channel {
 /// 站点基址
 pub const BASE_URL: &str = "https://panservice.mail.wo.cn";
 
+/// 上传相关常量（实测自前端 Uploader.js 与抓包）
+pub mod upload {
+    /// 服务端按**固定 8MB 步长**拼装分片；非 8MB 会在合并阶段 HTTP 500
+    pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+    /// 表单固定值
+    pub const CHANNEL: &str = "wocloud";
+    /// `GetZoneInfo` 的 appId
+    pub const ZONE_APP_ID: &str = "10000001";
+    /// `GetZoneInfo` 未下发时的兜底域名
+    pub const DEFAULT_HOST: &str = "https://hyupload.pan.wo.cn";
+    /// 上传路径
+    pub const PATH: &str = "/openapi/client/upload2C";
+}
+
+/// 前端 `random_str`：定长 `0-9A-Za-z` 随机串（batchNo 用 32 位）
+pub fn random_str(n: usize) -> String {
+    const POOL: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0x9E3779B9);
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    (0..n).map(|_| POOL[next() % POOL.len()] as char).collect()
+}
+
+/// 分片布局：**严格 ceil**（服务端按 8MB 步长拼装）
+///
+/// 20MB/8MB → `[8388608, 8388608, 3222784]`。
+///
+/// ⚠️ 不可用前端那套 `floor` + 末尾吸收：末片 >8MB 时服务端**仍返回成功**，
+///    但文件被**静默截断**成 `片数 × 8MB`（实测 20MB → 16,777,216 字节），
+///    备份"显示完成"却少了一截 —— 是最危险的失败模式。
+pub fn part_sizes(size: u64, chunk_size: usize) -> Vec<usize> {
+    let size = size as usize;
+    if size == 0 || chunk_size == 0 {
+        return vec![size];
+    }
+    let count = size.div_ceil(chunk_size).max(1);
+    let done = chunk_size * (count - 1);
+    let mut v = vec![chunk_size; count - 1];
+    v.push(size - done);
+    v
+}
+
 /// H5 渠道 clientId（取自 umi.js：YUNPAN_APP）
 pub const H5_CLIENT_ID: &str = "1001000035";
 /// H5 渠道默认密钥（与映射表中 1001000035 一致）
@@ -260,5 +309,40 @@ mod tests {
         // api-user：外层带 clientId
         let a = build_envelope("AppQueryUser", &payload, Some(H5_CLIENT_ID), H5_DEFAULT_SECRET_KEY, Channel::ApiUser.as_str(), 1, 2).unwrap();
         assert_eq!(a["body"]["clientId"], json!(H5_CLIENT_ID));
+    }
+
+    /// 分片布局必须与 Python 参考实现一致（服务端按 8MB 步长拼装）
+    #[test]
+    fn part_sizes_strict_ceil() {
+        let c = upload::CHUNK_SIZE;
+        // 20MB → 3 片，末片为余数（Python 实测同值）
+        assert_eq!(part_sizes(20_000_000, c), vec![8_388_608, 8_388_608, 3_222_784]);
+        // 25MB → 3 片（25,000,000 - 2×8,388,608 = 8,222,784）
+        assert_eq!(part_sizes(25_000_000, c), vec![8_388_608, 8_388_608, 8_222_784]);
+        // 恰好 8MB → 单片
+        assert_eq!(part_sizes(8_388_608, c), vec![8_388_608]);
+        // 9MB：严格 ceil 下是 **2 片**（9,000,000 - 8,388,608 = 611,392）。
+        // 注：Python 实测"9MB 单片成功"用的是前端 floor 布局；本插件走严格 ceil。
+        assert_eq!(part_sizes(9_000_000, c), vec![8_388_608, 611_392]);
+        // 空文件
+        assert_eq!(part_sizes(0, c), vec![0]);
+        // 各片之和必须等于总大小（防静默截断的第一道保险）
+        for size in [1u64, 8_388_607, 8_388_608, 8_388_609, 20_000_000, 33_000_000] {
+            let ps = part_sizes(size, c);
+            assert_eq!(ps.iter().sum::<usize>() as u64, size, "分片之和须等于 {size}");
+            // 非末片必须整 8MB
+            for p in ps.iter().take(ps.len() - 1) {
+                assert_eq!(*p, c, "非末片必须是整 8MB");
+            }
+        }
+    }
+
+    #[test]
+    fn random_str_len_and_charset() {
+        let s = random_str(32);
+        assert_eq!(s.len(), 32);
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric()), "只能是 0-9A-Za-z: {s}");
+        // 两次调用不应相同（种子取自纳秒时间）
+        assert_ne!(s, random_str(32));
     }
 }

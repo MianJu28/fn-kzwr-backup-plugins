@@ -6,18 +6,42 @@
 //!
 //! ⚠️ token 等同数据密钥，只留在内存，不写日志、不落盘。
 
+use crate::protocol;
 use crate::protocol::{h5_secret, Channel, BASE_URL, H5_CLIENT_ID};
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
-/// 一次写入的句柄
+/// 一次写入（上传）的句柄
 ///
-/// 上传能力**尚未实现**（联通云盘上传接口资料缺失），故 `write_begin` 一律失败，
-/// 句柄类型保留为空结构，待上传协议确认后填充。
+/// 服务端按**固定 8MB 步长**拼装分片，故这里攒够一个整片才发一片；末片在
+/// `write_end` 时作为余数发出。缓冲因此最多 8MB（不会把整个备份读进内存）。
 pub struct WriteH {
-    pub rel: String,
+    /// 云盘内完整路径
+    pub remote: String,
+    /// 文件名（末段）
+    pub file_name: String,
+    /// 父目录 id
+    pub dir_id: String,
+    /// 宿主声明的总字节数
     pub total: u64,
+    /// 已接收字节数
     pub fed: u64,
+    /// 已成功上传字节数
+    pub uploaded: u64,
+    /// 未满一片的缓冲
+    pub buf: Vec<u8>,
+    /// 已发送片数
+    pub part_index: u64,
+    /// 总分片数（严格 ceil）
+    pub total_parts: u64,
+    /// `{毫秒时间戳}_{6位随机}`
+    pub unique_id: String,
+    /// 同批次 32 位随机串
+    pub batch_no: String,
+    /// token 加密的 fileInfo（明文含 6 字段）
+    pub file_info: String,
+    /// 上传域名
+    pub host: String,
 }
 
 /// 一次读取的句柄：把整个文件读进内存后分块吐给宿主
@@ -43,6 +67,10 @@ pub struct Wopan {
     pub last_error: Mutex<String>,
     /// HTTP 客户端（blocking；插件不自己做异步）
     pub http: reqwest::blocking::Client,
+    /// 上传域名（`GetZoneInfo` 下发；懒加载缓存）
+    pub upload_host: Mutex<String>,
+    /// 文件类型表（findClassifyRule → fileTypes；懒加载缓存，用于 fileInfo.fileType）
+    pub file_types: Mutex<Option<Value>>,
 }
 
 impl Wopan {
@@ -115,6 +143,127 @@ impl Wopan {
             _ => Ok(data),
         }
     }
+
+    /// 取上传域名（`GetZoneInfo`），懒加载并缓存；失败时退回兜底域名
+    pub fn upload_host(&self) -> String {
+        if let Ok(g) = self.upload_host.lock() {
+            if !g.is_empty() {
+                return g.clone();
+            }
+        }
+        let host = match self.dispatch(
+            crate::CMD_GET_ZONE_INFO,
+            json!({ "appId": protocol::upload::ZONE_APP_ID }),
+            Channel::WoHome,
+        ) {
+            Ok(d) => d
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| protocol::upload::DEFAULT_HOST.to_string()),
+            Err(_) => protocol::upload::DEFAULT_HOST.to_string(),
+        };
+        if let Ok(mut g) = self.upload_host.lock() {
+            *g = host.clone();
+        }
+        host
+    }
+
+    /// 按扩展名取 fileType（findClassifyRule 的 fileTypes）；查不到回退 "0"
+    pub fn file_type(&self, filename: &str) -> String {
+        // 懒加载类型表
+        let need = self.file_types.lock().map(|g| g.is_none()).unwrap_or(false);
+        if need {
+            let table = self
+                .get_classify_rule()
+                .ok()
+                .and_then(|d| d.get("result").and_then(|r| r.get("fileTypes")).cloned());
+            if let Ok(mut g) = self.file_types.lock() {
+                *g = table;
+            }
+        }
+        let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let table = match self.file_types.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => None,
+        };
+        if let Some(t) = table {
+            for key in [ext.clone(), format!(".{ext}")] {
+                if let Some(e) = t.get(&key) {
+                    if let Some(s) = e.as_str() {
+                        return s.to_string();
+                    }
+                    if let Some(v) = e.get("type").and_then(|x| x.as_str()) {
+                        return v.to_string();
+                    }
+                }
+            }
+        }
+        "0".to_string()
+    }
+
+    /// `GET /wohome/free/v1/findClassifyRule`（**不走 dispatcher**，结构是 meta/result）
+    fn get_classify_rule(&self) -> Result<Value, String> {
+        let url = format!("{}{}", protocol::BASE_URL, "/wohome/free/v1/findClassifyRule");
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .map_err(|e| format!("findClassifyRule 请求失败: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("findClassifyRule HTTP {}", resp.status()));
+        }
+        resp.json::<Value>()
+            .map_err(|e| format!("findClassifyRule 响应不是 JSON: {e}"))
+    }
+
+    /// 上传一个分片（multipart，字段名 `file`）
+    ///
+    /// ⚠️ 必须用**独立连接**：上传网关对 dispatcher 的自定义头敏感（会 400）。
+    /// 该域名 TLS 偶发 UNEXPECTED_EOF，故重试若干次。
+    pub fn post_upload_part(
+        &self,
+        host: &str,
+        form: &[(&str, String)],
+        filename: &str,
+        chunk: &[u8],
+        retries: usize,
+    ) -> Result<reqwest::blocking::Response, String> {
+        let url = format!("{}{}", host, protocol::upload::PATH);
+        let mut last = String::new();
+        for attempt in 0..retries.max(1) {
+            // 每片都新建 client：避免复用连接的头污染；代价是每次 TLS 握手
+            let client = match reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return Err(format!("上传客户端创建失败: {e}")),
+            };
+            let mut mp = reqwest::blocking::multipart::Form::new();
+            for (k, v) in form {
+                mp = mp.text((*k).to_string(), v.clone());
+            }
+            let part = reqwest::blocking::multipart::Part::bytes(chunk.to_vec())
+                .file_name(filename.to_string())
+                .mime_str("application/octet-stream")
+                .map_err(|e| format!("构造分片失败: {e}"))?;
+            mp = mp.part("file".to_string(), part);
+
+            match client.post(&url).multipart(mp).send() {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    last = e.to_string();
+                    // 退避重试（域名间歇 UNEXPECTED_EOF）
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        500 * (attempt as u64 + 1),
+                    ));
+                }
+            }
+        }
+        Err(format!("上传连接失败（已重试）: {last}"))
+    }
 }
 
 /// 当前毫秒时间戳
@@ -175,6 +324,8 @@ pub fn parse_target(json_str: &str) -> Result<Wopan, String> {
         root,
         space_type,
         last_error: Mutex::new(String::new()),
+        upload_host: Mutex::new(String::new()),
+        file_types: Mutex::new(None),
         http: reqwest::blocking::Client::builder()
             // 站点对自定义头敏感（实测带 X-CM-SERVICE 等头访问 CDN 会 SSL 错误），
             // 这里只保留最小必要头，避免触发风控。

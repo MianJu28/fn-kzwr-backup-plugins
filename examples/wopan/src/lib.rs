@@ -3,11 +3,16 @@
 //! 采用 **H5 端协议**（`LoginByMobileV2`），不实现 Web / PC 等其他端。
 //! H5 渠道 token 有效期更长（实测约 60 天，Web 端约 7 天）。
 //!
-//! ## 状态说明（重要）
+//! ## 上传实现要点
 //!
-//! **上传能力尚未实现** —— 联通云盘的上传接口资料缺失（现有协议库只覆盖下载/列举/
-//! 建目录/删除）。因此本插件目前可：列举、下载（恢复）、删除、建目录、连通性测试；
-//! 但**新建备份（写入）会明确报错**，绝不静默吞掉数据。
+//! 上传**不走 dispatcher**：`GetZoneInfo` 取上传域名 → `POST {host}/openapi/client/upload2C`
+//! （multipart，字段名 `file`，8MB 分片）。
+//!
+//! ⚠️ **分片必须是严格 ceil 布局**（非末片整 8MB、末片为余数）。服务端按固定
+//! 8MB 步长拼装：若沿用前端那套 `floor`+末尾吸收，末片会 >8MB，服务端**仍返回成功**
+//! 但文件被**静默截断**成 `片数 × 8MB`（实测 20MB → 16,777,216）。
+//! 本插件在 `write_end` 校验"已发字节数 == 声明总字节数"，不符即报错，
+//! 绝不让"备份显示成功但云端少一截"静默发生。
 //!
 //! ## 凭据
 //!
@@ -68,7 +73,12 @@ mod cmd {
     pub const DELETE_FILE: &str = "DeleteFile";
     pub const GET_DOWNLOAD_URL: &str = "GetDownloadUrl";
     pub const LOGIN_SMS_V2: &str = "LoginByMobileV2";
+    /// 下发上传域名
+    pub const GET_ZONE_INFO: &str = "GetZoneInfo";
 }
+
+/// 供 `instance.rs` 复用（`upload_host()` 用到）
+pub(crate) use cmd::GET_ZONE_INFO as CMD_GET_ZONE_INFO;
 
 // ════════════════════════════════════════════════════════════════════════════
 // 目标能力表：生命周期
@@ -107,24 +117,170 @@ extern "C" fn write_begin(th: *mut c_void, rel: *const c_char, total: u64) -> *m
         }
         let inst = unsafe { &*(th as *const Wopan) };
         let rel_s = unsafe { sdk::from_c_str(rel) };
-        inst.err(format!(
-            "上传未实现：联通云盘上传接口资料缺失，无法写入 {rel_s}（{total} 字节）"
-        ));
-        None
+        let remote = join_remote(&inst.root, &rel_s)?;
+
+        // 父目录必须存在（逐层创建），否则上传的 directoryId 无效
+        let (parent, name) = match remote.rfind('/') {
+            Some(i) => (&remote[..i], remote[i + 1..].to_string()),
+            None => ("", remote.clone()),
+        };
+        if !parent.is_empty() && ensure_remote_dir(inst, parent).is_err() {
+            inst.err(format!("准备目录失败: {parent}"));
+            return None;
+        }
+        let dir_id = if parent.is_empty() {
+            "0".to_string()
+        } else {
+            match find_dir_id(inst, parent) {
+                Some(d) => d,
+                None => {
+                    inst.err(format!("目录不存在且创建失败: {parent}"));
+                    return None;
+                }
+            }
+        };
+
+        // 分片布局严格 ceil；total=0 时按单片处理
+        let size = if total == 0 { 1 } else { total };
+        let parts = protocol::part_sizes(size, protocol::upload::CHUNK_SIZE);
+        let file_type = inst.file_type(&name);
+        let info = json!({
+            "spaceType": inst.space_type,
+            "directoryId": dir_id,
+            "batchNo": "",   // 占位，下面用真实 batchNo 覆盖
+            "fileName": name,
+            "fileSize": total,
+            "fileType": file_type,
+        });
+        let batch_no = protocol::random_str(32);
+        let mut info = info;
+        info["batchNo"] = json!(batch_no.clone());
+        let file_info = match protocol::encrypt(&info.to_string(), &inst.token) {
+            Ok(s) => s,
+            Err(e) => {
+                inst.err(format!("构造 fileInfo 失败: {e}"));
+                return None;
+            }
+        };
+
+        let h = WriteH {
+            remote,
+            file_name: name,
+            dir_id,
+            total,
+            fed: 0,
+            uploaded: 0,
+            buf: Vec::new(),
+            part_index: 0,
+            total_parts: parts.len() as u64,
+            unique_id: format!("{}_{}", instance::now_ms(), protocol::random_str(6)),
+            batch_no,
+            file_info,
+            host: inst.upload_host(),
+        };
+        Some(Box::into_raw(Box::new(h)) as *mut c_void)
     })
 }
 
-extern "C" fn write_chunk(
-    _th: *mut c_void,
-    _h: *mut c_void,
-    _buf: *const u8,
-    _len: u32,
-) -> i32 {
-    -1
+/// 发送一个分片（非末片应为整 8MB；末片为余数）
+fn send_part(inst: &Wopan, h: &mut WriteH, chunk: &[u8]) -> Result<(), String> {
+    let form: Vec<(&str, String)> = vec![
+        ("uniqueId", h.unique_id.clone()),
+        ("accessToken", inst.token.clone()),
+        ("fileName", h.file_name.clone()),
+        ("psToken", "undefined".to_string()),
+        ("fileSize", h.total.to_string()),
+        ("totalPart", h.total_parts.to_string()),
+        ("partSize", chunk.len().to_string()),
+        ("partIndex", (h.part_index + 1).to_string()),
+        ("channel", protocol::upload::CHANNEL.to_string()),
+        ("directoryId", h.dir_id.clone()),
+        ("fileInfo", h.file_info.clone()),
+    ];
+    let resp = inst.post_upload_part(&h.host, &form, &h.file_name, chunk, 5)?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("上传分片失败 HTTP {status}: {}", &body[..body.len().min(200)]));
+    }
+    h.part_index += 1;
+    h.uploaded += chunk.len() as u64;
+    Ok(())
 }
 
-extern "C" fn write_end(_th: *mut c_void, _h: *mut c_void) -> i64 {
-    -1
+extern "C" fn write_chunk(
+    th: *mut c_void,
+    h: *mut c_void,
+    buf: *const u8,
+    len: u32,
+) -> i32 {
+    guard_i32(|| {
+        if th.is_null() || h.is_null() || buf.is_null() || len == 0 {
+            return 0;
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        let wh = unsafe { &mut *(h as *mut WriteH) };
+        let chunk = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+        wh.fed += len as u64;
+        wh.buf.extend_from_slice(chunk);
+
+        // 攒够整片就发（**末片留到 write_end**，因此处无法判断是否为末片）
+        let csize = protocol::upload::CHUNK_SIZE;
+        let mut sent = 0i32;
+        while wh.buf.len() >= csize {
+            let part: Vec<u8> = wh.buf.drain(..csize).collect();
+            match send_part(inst, wh, &part) {
+                Ok(()) => sent += part.len() as i32,
+                Err(e) => {
+                    inst.err(format!("上传失败: {e}"));
+                    return -1;
+                }
+            }
+        }
+        if sent > 0 {
+            sent
+        } else {
+            len as i32 // 数据已入缓冲，等价于"已接收"
+        }
+    })
+}
+
+extern "C" fn write_end(th: *mut c_void, h: *mut c_void) -> i64 {
+    guard_i64(|| {
+        if th.is_null() || h.is_null() {
+            return -1;
+        }
+        let inst = unsafe { &*(th as *const Wopan) };
+        let mut wh = unsafe { Box::from_raw(h as *mut WriteH) };
+
+        // 末片：把残余缓冲发出（严格 ceil 布局下，它就是余数）
+        if !wh.buf.is_empty() {
+            let part = std::mem::take(&mut wh.buf);
+            if let Err(e) = send_part(inst, &mut wh, &part) {
+                inst.err(format!("上传末片失败: {e}"));
+                return -1;
+            }
+        }
+        // total=0 的占位情形：从未收到数据也要发一个空片，否则云端无文件
+        if wh.part_index == 0 {
+            if let Err(e) = send_part(inst, &mut wh, &[]) {
+                inst.err(format!("上传空文件失败: {e}"));
+                return -1;
+            }
+        }
+
+        // ⚠️ 严格校验：服务端曾出现"返回成功但静默截断成 片数×8MB"。
+        //    这里确认发出的字节数与宿主声明的一致，不一致即报错，
+        //    绝不让"备份显示成功但云端少一截"静默发生。
+        if wh.uploaded != wh.total && wh.total > 0 {
+            inst.err(format!(
+                "上传字节数不符：已发 {} / 声明 {}（疑似服务端截断）",
+                wh.uploaded, wh.total
+            ));
+            return -1;
+        }
+        wh.uploaded as i64
+    })
 }
 
 extern "C" fn write_abort(_th: *mut c_void, h: *mut c_void) {
@@ -228,13 +384,15 @@ extern "C" fn delete(th: *mut c_void, rel: *const c_char) -> i32 {
             Some(r) => r,
             None => return -1,
         };
-        let fid = match find_fid(inst, &remote) {
-            Some(f) => f,
+        // ⚠️ 删除用 **id**（不是 fid）：前端 `fileAndDirIds` 对文件/目录都 push `e.id`；
+        //    只有 `GetDownloadUrl` 用 fid。传 fid 会失败。
+        let id = match find_id(inst, &remote) {
+            Some(i) => i,
             None => return -1,
         };
         match inst.dispatch(
             cmd::DELETE_FILE,
-            json!({ "fileList": [fid], "dirList": [], "spaceType": inst.space_type }),
+            json!({ "fileList": [id], "dirList": [], "spaceType": inst.space_type }),
             Channel::WoHome,
         ) {
             Ok(_) => 0,
@@ -257,40 +415,14 @@ extern "C" fn ensure_dir(th: *mut c_void, rel: *const c_char) -> i32 {
             Some(r) => r,
             None => return -1,
         };
-        // 云盘接口一次只能建一层，故逐层创建
-        let mut cur = String::new();
-        for seg in remote.split('/') {
-            if seg.is_empty() {
-                continue;
-            }
-            if !cur.is_empty() {
-                cur.push('/');
-            }
-            cur.push_str(seg);
-            if find_fid(inst, &cur).is_some() {
-                continue;
-            }
-            let parent_id = match cur.rfind('/') {
-                Some(i) => find_fid(inst, &cur[..i]).unwrap_or_else(|| "0".to_string()),
-                None => "0".to_string(),
-            };
-            if inst
-                .dispatch(
-                    cmd::CREATE_DIRECTORY,
-                    json!({
-                        "directoryName": seg,
-                        "parentDirectoryId": parent_id,
-                        "familyId": "0",
-                        "spaceType": inst.space_type,
-                    }),
-                    Channel::WoHome,
-                )
-                .is_err()
-            {
-                return -1;
+        // 逐层创建（云盘接口一次只能建一层）
+        match ensure_remote_dir(inst, &remote) {
+            Ok(_) => 0,
+            Err(e) => {
+                inst.err(format!("建目录失败: {e}"));
+                -1
             }
         }
-        0
     })
 }
 
@@ -396,6 +528,129 @@ fn list_files(inst: &Wopan, prefix: &str) -> Result<Vec<Value>, String> {
         }));
     }
     Ok(out)
+}
+
+/// 找节点的 **`id`**（删除/移动等写操作用 id；只有下载用 fid）
+fn find_id(inst: &Wopan, remote: &str) -> Option<String> {
+    list_entries(inst, remote)?
+        .into_iter()
+        .find_map(|it| {
+            it.get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// 找目录的 id（找不到返回 None；根目录为 "0"）
+fn find_dir_id(inst: &Wopan, remote: &str) -> Option<String> {
+    if remote.trim_matches('/').is_empty() {
+        return Some("0".to_string());
+    }
+    let items = match parent_entries(inst, remote) {
+        Some(v) => v,
+        None => return None,
+    };
+    let (_, name) = match remote.rfind('/') {
+        Some(i) => (&remote[..i], &remote[i + 1..]),
+        None => ("", remote),
+    };
+    for it in items {
+        let n = it.get("fileName").or_else(|| it.get("name")).and_then(|x| x.as_str()).unwrap_or("");
+        if n != name {
+            continue;
+        }
+        let is_dir = it
+            .get("fileType")
+            .and_then(|t| t.as_str())
+            .map(|t| t == "0" || t.eq_ignore_ascii_case("directory") || t.eq_ignore_ascii_case("folder"))
+            .unwrap_or(false);
+        if is_dir {
+            return it.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// 确保云盘内目录存在（逐层创建），返回其 id
+fn ensure_remote_dir(inst: &Wopan, remote: &str) -> Result<String, String> {
+    if remote.trim_matches('/').is_empty() {
+        return Ok("0".to_string());
+    }
+    let mut cur = String::new();
+    let mut last_id = "0".to_string();
+    for seg in remote.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        if !cur.is_empty() {
+            cur.push('/');
+        }
+        cur.push_str(seg);
+        if let Some(id) = find_dir_id(inst, &cur) {
+            last_id = id;
+            continue;
+        }
+        // 建这一层
+        inst.dispatch(
+            cmd::CREATE_DIRECTORY,
+            json!({
+                "directoryName": seg,
+                "parentDirectoryId": last_id,
+                "familyId": "0",
+                "spaceType": inst.space_type,
+            }),
+            Channel::WoHome,
+        )?;
+        last_id = find_dir_id(inst, &cur).unwrap_or_else(|| "0".to_string());
+    }
+    Ok(last_id)
+}
+
+/// 列出某目录下所有条目（原始节点）
+fn parent_entries(inst: &Wopan, remote: &str) -> Option<Vec<Value>> {
+    let (parent, _) = match remote.rfind('/') {
+        Some(i) => (&remote[..i], &remote[i + 1..]),
+        None => ("", remote),
+    };
+    let dir_id = if parent.trim_matches('/').is_empty() {
+        "0".to_string()
+    } else {
+        find_dir_id(inst, parent)?
+    };
+    let data = inst
+        .dispatch(
+            cmd::QUERY_ALL_FILES,
+            json!({ "directoryId": dir_id, "spaceType": inst.space_type, "pageNum": 1, "pageSize": 1000 }),
+            Channel::WoHome,
+        )
+        .ok()?;
+    Some(
+        data.get("fileList")
+            .or_else(|| data.get("files"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+/// 按完整路径取到该节点本身（在其父目录条目里按名字匹配）
+fn list_entries(inst: &Wopan, remote: &str) -> Option<Vec<Value>> {
+    let (_, name) = match remote.rfind('/') {
+        Some(i) => (&remote[..i], &remote[i + 1..]),
+        None => ("", remote),
+    };
+    let items = parent_entries(inst, remote)?;
+    let matched: Vec<Value> = items
+        .into_iter()
+        .filter(|it| {
+            it.get("fileName")
+                .or_else(|| it.get("name"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                == name
+        })
+        .collect();
+    Some(matched)
 }
 
 /// 按云盘内路径找节点的 **`fid`**（不是 `id`！误传 id 会得到 9999）
@@ -602,9 +857,9 @@ extern "C" fn health(_cfg: *const c_char) -> *mut c_char {
         json!([{
             "key": "wopan_target",
             "title": "联通云盘（沃云盘）备份目标",
-            "status": "warn",
-            "detail": "目标能力表已加载（fn_kzwr_plugin_target_v1）；H5 端协议。上传能力尚未实现，当前可用于列举/恢复/删除。",
-            "hint": "上传接口资料确认后将补齐写入能力"
+            "status": "ok",
+            "detail": "目标能力表已加载（fn_kzwr_plugin_target_v1）；H5 端协议，支持备份写入（8MB 分片直传）、列举、恢复、删除。",
+            "hint": null
         }])
         .to_string()
     })
@@ -648,7 +903,8 @@ mod tests {
 
     /// 上传未实现时必须返回 NULL（宿主据此报错），绝不能给假句柄
     #[test]
-    fn write_is_explicitly_unsupported() {
+    /// 空实例句柄调用 write_begin 必须返回 NULL（而不是崩溃或伪造句柄）
+    fn write_begin_null_instance_is_null() {
         assert!(write_begin(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
     }
 
