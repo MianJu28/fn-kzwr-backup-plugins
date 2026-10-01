@@ -234,6 +234,13 @@ jobs:
           # 提交两样东西：
           #   index.json/.sig  —— 供市场 raw 直取（与 Release 资产互为冗余）
           #   build-state.json —— 下次构建的**增量基线**（权威来源，缓存仅加速）
+          #
+          # ⚠️ 本工作流由**打 tag**触发 ⇒ checkout 出来是 **detached HEAD**（不在任何
+          #    分支上）。此时裸 `git push` 会直接失败：
+          #      fatal: You are not currently on a branch.
+          #    必须写**显式 refspec** `HEAD:<分支>` 才推得出去（已实测复现）。
+          #    不修的后果：Release 资产正常，但仓库里的 index.json **永远不更新**，
+          #    而市场主源正是 raw 直取 main/index.json ⇒ 市场拿不到任何插件。
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add index.json index.json.sig build-state.json
@@ -241,5 +248,5 @@ jobs:
             echo "索引与状态均无变化，跳过提交"
           else
             git commit -m "chore: 更新索引与增量状态（${{ github.ref_name }}）"
-            git push
+            git push origin "HEAD:refs/heads/${{ github.event.repository.default_branch }}"
           fi
