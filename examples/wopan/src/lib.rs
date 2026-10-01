@@ -27,6 +27,7 @@
 //! - token 只留在内存，不写日志、不落盘
 //! - 所有 FFI 入口用 guard 闭包包裹，panic 绝不跨越 FFI
 
+pub mod config;
 pub mod instance;
 pub mod protocol;
 
@@ -75,6 +76,11 @@ mod cmd {
     pub const LOGIN_SMS_V2: &str = "LoginByMobileV2";
     /// 下发上传域名
     pub const GET_ZONE_INFO: &str = "GetZoneInfo";
+    // ── 回收站 ──
+    pub const QUERY_RECYCLE: &str = "QueryRecycleData";
+    pub const REDUCTION_RECYCLE: &str = "ReductionRecycleData";
+    pub const DELETE_RECYCLE: &str = "DeleteRecycleData";
+    pub const EMPTY_RECYCLE: &str = "EmptyRecycleData";
 }
 
 /// 供 `instance.rs` 复用（`upload_host()` 用到）
@@ -721,8 +727,116 @@ extern "C" fn action(action: *const c_char, request: *const c_char) -> *mut c_ch
     guard_str(move || match action.as_str() {
         "/sms/send" => sms_send(&request),
         "/sms/login" => sms_login(&request),
+        "/user/info" => user_info_action(),
+        "/recycle/list" => recycle_list_action(&request),
+        "/recycle/empty" => recycle_empty_action(&request),
         other => sdk::json::error(&format!("未知动作：{other}")),
     })
+}
+
+/// 从自管配置构造实例；无令牌时给出可操作的提示
+fn inst_from_self_config() -> Result<crate::instance::Wopan, String> {
+    let cfg = config::SelfConfig::load();
+    cfg.instance()
+        .ok_or_else(|| "尚未保存令牌：请先用「用验证码登录」获取并保存令牌".to_string())
+}
+
+/// 用户信息（**脱敏**后返回：不回显 token，手机号打码）
+fn user_info_action() -> String {
+    let inst = match inst_from_self_config() {
+        Ok(i) => i,
+        Err(e) => return sdk::json::error(&e),
+    };
+    match inst.user_info() {
+        Ok(v) => {
+            let mask = |s: &str| -> String {
+                let n = s.chars().count();
+                if n <= 7 {
+                    return "*".repeat(n);
+                }
+                let head: String = s.chars().take(3).collect();
+                let tail: String = s.chars().skip(n - 4).collect();
+                format!("{head}****{tail}")
+            };
+            let phone = v
+                .get("userName")
+                .or_else(|| v.get("phone"))
+                .and_then(|x| x.as_str())
+                .map(mask)
+                .unwrap_or_default();
+            json!({
+                "success": true,
+                "user": {
+                    "name": v.get("userName").and_then(|x| x.as_str()).unwrap_or(""),
+                    "phone_masked": phone,
+                    // 只暴露容量相关（若存在），不整包回显
+                    "total": v.get("totalSize").or_else(|| v.get("total")).and_then(|x| x.as_u64()),
+                    "used": v.get("usedSize").or_else(|| v.get("used")).and_then(|x| x.as_u64()),
+                }
+            })
+            .to_string()
+        }
+        Err(e) => sdk::json::error(&format!("查询用户信息失败: {e}")),
+    }
+}
+
+/// 回收站列表
+fn recycle_list_action(request: &str) -> String {
+    let inst = match inst_from_self_config() {
+        Ok(i) => i,
+        Err(e) => return sdk::json::error(&e),
+    };
+    // 可选 pageNo/pageSize 从 body 取
+    let body = serde_json::from_str::<Value>(request)
+        .ok()
+        .and_then(|v| v.get("body").cloned())
+        .unwrap_or(Value::Null);
+    let page_no = body.get("pageNo").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+    let page_size = body.get("pageSize").and_then(|x| x.as_u64()).unwrap_or(20) as u32;
+
+    match inst.query_recycle(page_no, page_size) {
+        Ok(v) => {
+            let arr = v.as_array().cloned().unwrap_or_default();
+            let items: Vec<Value> = arr
+                .iter()
+                .map(|it| {
+                    json!({
+                        // 实测字段：name / fileSize / deleteTime / deleteNo / keepDays
+                        "name": it.get("name").and_then(|x| x.as_str()).unwrap_or(""),
+                        "size": it.get("fileSize").or_else(|| it.get("size")).and_then(|x| x.as_u64()).unwrap_or(0),
+                        "delete_time": it.get("deleteTime").and_then(|x| x.as_str()).unwrap_or(""),
+                        "keep_days": it.get("keepDays").and_then(|x| x.as_u64()),
+                        "delete_no": it.get("deleteNo").and_then(|x| x.as_str()).unwrap_or(""),
+                    })
+                })
+                .collect();
+            json!({ "success": true, "count": items.len(), "items": items }).to_string()
+        }
+        Err(e) => sdk::json::error(&format!("查询回收站失败: {e}")),
+    }
+}
+
+/// 清空回收站（**危险操作**：不可恢复）
+///
+/// 宿主侧前端已用 `confirm` 文案做二次确认（见 describe.json 的 danger 按钮）。
+fn recycle_empty_action(request: &str) -> String {
+    let inst = match inst_from_self_config() {
+        Ok(i) => i,
+        Err(e) => return sdk::json::error(&e),
+    };
+    // 显式确认位：避免误触发（前端 confirm 之外再加一道）
+    let confirmed = serde_json::from_str::<Value>(request)
+        .ok()
+        .and_then(|v| v.get("body").cloned())
+        .and_then(|b| b.get("confirm").and_then(|c| c.as_bool()))
+        .unwrap_or(false);
+    if !confirmed {
+        return sdk::json::error("未确认：清空回收站不可恢复，需显式确认");
+    }
+    match inst.empty_recycle() {
+        Ok(_) => sdk::json::ok_message("回收站已清空"),
+        Err(e) => sdk::json::error(&format!("清空回收站失败: {e}")),
+    }
 }
 
 /// 发送短信验证码（独立端点，不走 dispatcher）
@@ -822,7 +936,34 @@ fn sms_login(request: &str) -> String {
                             .map(|s| s.to_string())
                     });
                 match token {
-                    Some(t) if !t.is_empty() => json!({ "success": true, "token": t }).to_string(),
+                    Some(t) if !t.is_empty() => {
+                        // 顺手把令牌存进**插件自管配置**（宿主 seal 加密落盘），
+                        // 这样插件页的「用户信息」「回收站」无需再让用户粘一次。
+                        // 存失败不影响本次登录结果，只提示。
+                        let mut c = config::SelfConfig::load();
+                        c.set_token(&t);
+                        c.phone = phone.to_string();
+                        let saved = match c.save() {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("[wopan] 令牌未能持久化: {e}");
+                                false
+                            }
+                        };
+                        // ⚠️ 仍返回 token：用户可能想填进「目标」配置。
+                        //    但**不回显**是否保存失败的原因细节，避免噪音。
+                        json!({
+                            "success": true,
+                            "token": t,
+                            "saved": saved,
+                            "message": if saved {
+                                "登录成功，令牌已加密保存；可直接在插件页查看用户信息/清理回收站"
+                            } else {
+                                "登录成功；令牌未能保存（可手动填入目标配置）"
+                            }
+                        })
+                        .to_string()
+                    }
                     _ => sdk::json::error("登录成功但未取得 access_token"),
                 }
             }
@@ -834,14 +975,59 @@ fn sms_login(request: &str) -> String {
 
 extern "C" fn health(_cfg: *const c_char) -> *mut c_char {
     guard_str(|| {
-        json!([{
+        let mut checks = vec![json!({
             "key": "wopan_target",
             "title": "联通云盘（沃云盘）备份目标",
             "status": "ok",
             "detail": "目标能力表已加载（fn_kzwr_plugin_target_v1）；H5 端协议，支持备份写入（8MB 分片直传）、列举、恢复、删除。",
             "hint": null
-        }])
-        .to_string()
+        })];
+
+        // 有自管令牌时，顺带做一次登录态体检（拿用户信息）。
+        // 体检**不得阻塞太久**：这里已有令牌，一次请求即可。
+        let cfg = config::SelfConfig::load();
+        if let Some(inst) = cfg.instance() {
+            match inst.user_info() {
+                Ok(v) => {
+                    let name = v.get("userName").and_then(|x| x.as_str()).unwrap_or("");
+                    let used = v.get("usedSize").or_else(|| v.get("used")).and_then(|x| x.as_u64());
+                    let total = v.get("totalSize").or_else(|| v.get("total")).and_then(|x| x.as_u64());
+                    let detail = match (used, total) {
+                        (Some(u), Some(t)) if t > 0 => format!(
+                            "登录态有效（{name}）；容量 {:.1}/{:.1} GB",
+                            u as f64 / 1e9,
+                            t as f64 / 1e9
+                        ),
+                        _ => format!("登录态有效（{name}）"),
+                    };
+                    checks.push(json!({
+                        "key": "wopan_login",
+                        "title": "登录态",
+                        "status": "ok",
+                        "detail": detail,
+                        "hint": null
+                    }));
+                }
+                Err(e) => {
+                    checks.push(json!({
+                        "key": "wopan_login",
+                        "title": "登录态",
+                        "status": "warn",
+                        "detail": format!("令牌不可用：{e}"),
+                        "hint": "在插件页用「短信登录」重新获取令牌（H5 渠道约 60 天有效）"
+                    }));
+                }
+            }
+        } else {
+            checks.push(json!({
+                "key": "wopan_login",
+                "title": "登录态",
+                "status": "warn",
+                "detail": "尚未保存令牌",
+                "hint": "在插件页点「发送短信验证码」→「用验证码登录」"
+            }));
+        }
+        serde_json::to_string(&checks).unwrap_or_else(|_| "[]".to_string())
     })
 }
 
@@ -914,7 +1100,11 @@ mod tests {
         parse_target(&j).ok()
     }
 
-    /// 诊断：wohome 通道逐一试探命令字 + 三种 clientId 摆放
+    /// 诊断：逐一试探 wohome 命令字是否可达
+    ///
+    /// ⚠️ 这里**只用 `inst.dispatch()`**（它带 `accesstoken` 头）。
+    ///    不要在这里手写裸请求做"clientId 摆放"对照 —— 裸请求缺 `accesstoken`
+    ///    头会一律返回 1001，得出的结论是假的（曾据此误判过一轮）。
     #[test]
     #[ignore]
     /// 真实上传往返：建目录 → 上传 → 校验云端大小 → 下载比对 → 删除
@@ -1004,6 +1194,59 @@ mod tests {
         println!("[4] 已清理测试文件");
     }
 
+    /// 真实联网：用户信息 + 回收站列表（**只读**，不改动账号数据）
+    #[test]
+    #[ignore]
+    fn live_user_and_recycle() {
+        let inst = match live_instance() { Some(i)=>i, None=>{println!("跳过");return;} };
+        // 1) 用户信息
+        match inst.user_info() {
+            Ok(v) => {
+                println!("[1] 用户信息 keys={:?}", v.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                println!("     userName={:?}", v.get("userName").and_then(|x|x.as_str()));
+                println!("     原始（截断）={}", v.to_string().chars().take(300).collect::<String>());
+            }
+            Err(e) => println!("[1] 用户信息失败: {e}"),
+        }
+        // 2) 回收站列表
+        match inst.query_recycle(1, 20) {
+            Ok(v) => {
+                let arr = v.as_array().cloned().unwrap_or_default();
+                println!("[2] 回收站 {} 项", arr.len());
+                for it in arr.iter().take(3) {
+                    println!("     原始项={}", it.to_string().chars().take(220).collect::<String>());
+                }
+            }
+            Err(e) => println!("[2] 回收站失败: {e}"),
+        }
+    }
+
+    /// 真实联网：清空回收站（**危险**，不可恢复）
+    #[test]
+    #[ignore]
+    fn live_empty_recycle() {
+        let inst = match live_instance() { Some(i)=>i, None=>{println!("跳过");return;} };
+        // 先看清理前有多少项
+        let before = inst.query_recycle(1, 50).ok()
+            .and_then(|v| v.as_array().map(|a| a.len())).unwrap_or(0);
+        println!("[1] 清空前回收站 {} 项", before);
+        match inst.empty_recycle() {
+            Ok(v) => println!("[2] EmptyRecycleData OK: {}", v.to_string().chars().take(200).collect::<String>()),
+            Err(e) => { println!("[2] 清空失败: {e}"); return; }
+        }
+        // 再查应为空
+        match inst.query_recycle(1, 50) {
+            Ok(v) => {
+                let after = v.as_array().map(|a| a.len()).unwrap_or(0);
+                println!("[3] 清空后回收站 {} 项", after);
+                assert_eq!(after, 0, "清空后应为空");
+            }
+            Err(e) => println!("[3] 复查失败: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn live_diag() {
         let inst = match live_instance() {
             Some(i) => i,
@@ -1029,45 +1272,6 @@ mod tests {
             match inst.dispatch(c, p, Channel::WoHome) {
                 Ok(v) => println!("[wohome] {c}: OK keys={:?}", v.as_object().map(|o| o.keys().collect::<Vec<_>>())),
                 Err(e) => println!("[wohome] {c}: {e}"),
-            }
-        }
-
-        // clientId 摆放变体（只测 QueryAllFiles）
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let payload = json!({"parentDirectoryId":"","spaceType":"0","pageNum":0,"pageSize":10,"sortRule":0});
-        let mk = |seq: i64, body: serde_json::Value| {
-            json!({
-                "header": {"key":"QueryAllFiles","resTime":t,"reqSeq":seq,"channel":"wohome",
-                           "sign": protocol::make_sign("QueryAllFiles", t, seq, "wohome", ""), "version":""},
-                "body": body,
-            })
-        };
-        let mut pa = payload.clone();
-        if let Some(o) = pa.as_object_mut() {
-            o.insert("clientId".into(), json!(inst.client_id.clone()));
-        }
-        let variants: Vec<(&str, serde_json::Value)> = vec![
-            ("A:clientId在param内", mk(1, json!({"param": protocol::encrypt(&pa.to_string(), &inst.token).unwrap(), "secret": true}))),
-            ("B:clientId在外层", mk(2, json!({"param": protocol::encrypt(&payload.to_string(), &inst.token).unwrap(), "secret": true, "clientId": inst.client_id.clone()}))),
-            ("C:不放clientId", mk(3, json!({"param": protocol::encrypt(&payload.to_string(), &inst.token).unwrap(), "secret": true}))),
-        ];
-        for (name, env) in variants {
-            match inst
-                .http
-                .post(format!("{}{}", protocol::BASE_URL, "/wohome/dispatcher"))
-                .json(&env)
-                .send()
-            {
-                Ok(r) => {
-                    let b: serde_json::Value = r.json().unwrap_or(serde_json::Value::Null);
-                    let code = b.get("RSP").and_then(|x| x.get("RSP_CODE")).and_then(|c| c.as_str()).unwrap_or("");
-                    let desc = b.get("RSP").and_then(|x| x.get("RSP_DESC")).and_then(|c| c.as_str()).unwrap_or("");
-                    println!("  {name} -> {code} {desc}");
-                }
-                Err(e) => println!("  {name} -> 请求失败 {e}"),
             }
         }
     }

@@ -153,6 +153,52 @@ impl Wopan {
         }
     }
 
+    /// 用户信息（`AppQueryUser`；走 api-user 通道，DATA 用**客户端密钥**解密）
+    ///
+    /// 返回原始 DATA；**调用方负责脱敏**，不要把 token 或完整用户信息回显给前端。
+    pub fn user_info(&self) -> Result<Value, String> {
+        self.dispatch(
+            crate::cmd::QUERY_USER,
+            json!({ "accessToken": self.token }),
+            Channel::ApiUser,
+        )
+    }
+
+    /// 回收站列表（`QueryRecycleData`）
+    ///
+    /// `pageNo` 从 **1** 开始（注意与文件列表的 pageNum 从 0 不同）；
+    /// 响应 DATA 直接是数组，末页判据 `len < pageSize`；每项含 `deleteNo`。
+    pub fn query_recycle(&self, page_no: u32, page_size: u32) -> Result<Value, String> {
+        self.dispatch(
+            crate::cmd::QUERY_RECYCLE,
+            json!({ "pageNo": page_no, "pageSize": page_size, "sortRule": 0 }),
+            Channel::WoHome,
+        )
+    }
+
+    /// 清空回收站（`EmptyRecycleData`，**无参数**，不可恢复）
+    pub fn empty_recycle(&self) -> Result<Value, String> {
+        self.dispatch(crate::cmd::EMPTY_RECYCLE, json!({}), Channel::WoHome)
+    }
+
+    /// 还原回收站项（`ReductionRecycleData`，`deleteNos` 为数组）
+    pub fn restore_recycle(&self, delete_nos: &[String]) -> Result<Value, String> {
+        self.dispatch(
+            crate::cmd::REDUCTION_RECYCLE,
+            json!({ "deleteNos": delete_nos }),
+            Channel::WoHome,
+        )
+    }
+
+    /// 彻底删除回收站项（`DeleteRecycleData`，不可恢复）
+    pub fn purge_recycle(&self, delete_nos: &[String]) -> Result<Value, String> {
+        self.dispatch(
+            crate::cmd::DELETE_RECYCLE,
+            json!({ "deleteNos": delete_nos }),
+            Channel::WoHome,
+        )
+    }
+
     /// 取上传域名（`GetZoneInfo`），懒加载并缓存；失败时退回兜底域名
     pub fn upload_host(&self) -> String {
         if let Ok(g) = self.upload_host.lock() {

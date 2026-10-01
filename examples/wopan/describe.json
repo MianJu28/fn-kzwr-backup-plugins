@@ -63,7 +63,7 @@
     "blocks": [
       {
         "type": "tips",
-        "text": "H5 端协议。支持备份写入（8MB 分片直传）、列举、恢复、删除。"
+        "text": "H5 端协议。支持备份写入（8MB 分片直传）、列举、恢复、删除。令牌用宿主密钥加密后存在插件自己的数据目录，不会明文落盘。"
       },
       {
         "type": "button",
@@ -73,9 +73,28 @@
       },
       {
         "type": "button",
-        "label": "用验证码登录（获取令牌）",
+        "label": "用验证码登录（获取并保存令牌）",
         "action": "/sms/login",
         "danger": false
+      },
+      {
+        "type": "button",
+        "label": "查看用户信息",
+        "action": "/user/info",
+        "danger": false
+      },
+      {
+        "type": "button",
+        "label": "查看回收站",
+        "action": "/recycle/list",
+        "danger": false
+      },
+      {
+        "type": "button",
+        "label": "清空回收站",
+        "action": "/recycle/empty",
+        "confirm": "清空回收站将永久删除其中全部文件，且不可恢复。确定继续？",
+        "danger": true
       }
     ]
   }
