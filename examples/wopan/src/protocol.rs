@@ -58,6 +58,15 @@ pub fn decrypt(ciphertext: &str, secret: &str) -> Result<String, String> {
 }
 
 /// `sign = MD5(cmd + resTime + reqSeq + channel + version)`
+/// 对齐 Python `json.dumps(separators=(",", ":"), ensure_ascii=False)`：
+/// 紧凑无空格、非 ASCII 不转义（中文路径原样出现）。
+///
+/// ⚠️ 直接用 `Value::to_string()` 也可得到紧凑 JSON，但这里显式实现一次，
+///    确保与参考实现的序列化行为**逐字节一致**（服务端可能对 body 做校验）。
+pub fn dumps(v: &Value) -> String {
+    serde_json::to_string(v).unwrap_or_default()
+}
+
 pub fn make_sign(cmd: &str, res_time: i64, req_seq: i64, channel: &str, version: &str) -> String {
     let raw = format!("{cmd}{res_time}{req_seq}{channel}{version}");
     let d = Md5::digest(raw.as_bytes());

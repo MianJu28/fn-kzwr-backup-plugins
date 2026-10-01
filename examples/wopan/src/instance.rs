@@ -106,10 +106,19 @@ impl Wopan {
         )?;
 
         let url = format!("{BASE_URL}{}", channel.path());
+        // ⚠️ 严格对齐 Python 参考实现 `_post()`：
+        //   1) 每次请求都带 **`accesstoken: <token>`** 头 —— wohome 通道据此识别
+        //      登录态。缺了这个头，wohome 一律返回 `1001 无效登录信息`
+        //      （而 api-user 不依赖它，故此前 api-user 通、wohome 全挂）。
+        //   2) body 手动序列化成 UTF-8 字节（Python 用 `dumps(data).encode()`），
+        //      而非 `json=`（后者会走不同的 Content-Type 处理）。
+        let body_bytes = crate::protocol::dumps(&envelope).into_bytes();
         let resp = self
             .http
             .post(&url)
-            .json(&envelope)
+            .header("accesstoken", self.token.as_str())
+            .header("Content-Type", "application/json;charset=UTF-8")
+            .body(body_bytes)
             .send()
             .map_err(|e| format!("请求失败: {e}"))?;
         let status = resp.status();
@@ -316,6 +325,7 @@ pub fn parse_target(json_str: &str) -> Result<Wopan, String> {
         })
         .unwrap_or_else(|| "0".to_string());
 
+    let cid_for_headers = client_id.clone();
     Ok(Wopan {
         phone,
         token,
@@ -326,12 +336,41 @@ pub fn parse_target(json_str: &str) -> Result<Wopan, String> {
         last_error: Mutex::new(String::new()),
         upload_host: Mutex::new(String::new()),
         file_types: Mutex::new(None),
-        http: reqwest::blocking::Client::builder()
-            // 站点对自定义头敏感（实测带 X-CM-SERVICE 等头访问 CDN 会 SSL 错误），
-            // 这里只保留最小必要头，避免触发风控。
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()
-            .map_err(|e| format!("HTTP 客户端创建失败: {e}"))?,
+        // ⚠️ dispatcher 请求**必须**带 H5 渠道固定头，否则 wohome 通道返回
+        //    `1001 登录态失效`（实测：只发 UA 时 api-user 通、wohome 1001）。
+        //    这些头是服务端识别渠道的依据，不是可选项。
+        //
+        //    另注：**上传/下载不能复用本客户端** —— 网关（hyupload/hydownload）
+        //    对 X-CM-SERVICE 这类头敏感，会 400；那两处用独立连接（见
+        //    `post_upload_part` 与 `read_begin`）。
+        http: {
+            use reqwest::header::{HeaderMap, HeaderValue};
+            let mut headers = HeaderMap::new();
+            let cid = cid_for_headers;
+            for (k, v) in [
+                ("X-CM-SERVICE", "PHONE"),
+                ("source-type", "woapi"),
+                ("X-YP-Open-Version", "v1.0"),
+                ("Client-Id", cid.as_str()),
+                ("X-YP-Client-Id", cid.as_str()),
+                ("clientId", cid.as_str()),
+                // Python session 默认头里还有这两个（站点可能据此校验来源）
+                ("Origin", "https://pan.wo.cn"),
+                ("Referer", "https://pan.wo.cn/"),
+            ] {
+                if let (Ok(name), Ok(val)) = (
+                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_str(v),
+                ) {
+                    headers.insert(name, val);
+                }
+            }
+            reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .default_headers(headers)
+                .build()
+                .map_err(|e| format!("HTTP 客户端创建失败: {e}"))?
+        },
     })
 }
 

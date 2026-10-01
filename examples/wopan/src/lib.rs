@@ -485,7 +485,7 @@ fn list_files(inst: &Wopan, prefix: &str) -> Result<Vec<Value>, String> {
     };
     let data = inst.dispatch(
         cmd::QUERY_ALL_FILES,
-        json!({ "directoryId": dir_id, "spaceType": inst.space_type, "pageNum": 1, "pageSize": 1000 }),
+        json!({ "parentDirectoryId": dir_id, "spaceType": inst.space_type, "pageNum": 0, "pageSize": 1000, "sortRule": 0 }),
         Channel::WoHome,
     )?;
     let items = data
@@ -620,7 +620,7 @@ fn parent_entries(inst: &Wopan, remote: &str) -> Option<Vec<Value>> {
     let data = inst
         .dispatch(
             cmd::QUERY_ALL_FILES,
-            json!({ "directoryId": dir_id, "spaceType": inst.space_type, "pageNum": 1, "pageSize": 1000 }),
+            json!({ "parentDirectoryId": dir_id, "spaceType": inst.space_type, "pageNum": 0, "pageSize": 1000, "sortRule": 0 }),
             Channel::WoHome,
         )
         .ok()?;
@@ -670,7 +670,7 @@ fn find_fid(inst: &Wopan, remote: &str) -> Option<String> {
     let data = inst
         .dispatch(
             cmd::QUERY_ALL_FILES,
-            json!({ "directoryId": parent_id, "spaceType": inst.space_type, "pageNum": 1, "pageSize": 1000 }),
+            json!({ "parentDirectoryId": parent_id, "spaceType": inst.space_type, "pageNum": 0, "pageSize": 1000, "sortRule": 0 }),
             Channel::WoHome,
         )
         .ok()?;
@@ -911,5 +911,97 @@ mod tests {
     #[test]
     fn null_handle_is_safe() {
         assert_eq!(read_chunk(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // **真实联网**测试（默认不跑，需真实 token）
+    //   WOPAN_TOKEN=<token> cargo test --lib -- --ignored --nocapture
+    // 只打印脱敏信息，绝不输出 token 明文。
+    // ══════════════════════════════════════════════════════════════════════
+
+    fn live_instance() -> Option<Wopan> {
+        let token = std::env::var("WOPAN_TOKEN").ok()?;
+        if token.is_empty() {
+            return None;
+        }
+        let j = json!({
+            "username": std::env::var("WOPAN_PHONE").unwrap_or_default(),
+            "password": token,
+            "url": "",
+            "config": { "space_type": "0" },
+        })
+        .to_string();
+        parse_target(&j).ok()
+    }
+
+    /// 诊断：wohome 通道逐一试探命令字 + 三种 clientId 摆放
+    #[test]
+    #[ignore]
+    fn live_diag() {
+        let inst = match live_instance() {
+            Some(i) => i,
+            None => {
+                println!("跳过：未设 WOPAN_TOKEN");
+                return;
+            }
+        };
+        println!("client_id={} token_len={}", inst.client_id, inst.token.len());
+
+        match inst.dispatch(cmd::QUERY_USER, json!({ "accessToken": inst.token }), Channel::ApiUser) {
+            Ok(v) => println!("[api-user] AppQueryUser OK: userName={:?}", v.get("userName").and_then(|x| x.as_str())),
+            Err(e) => println!("[api-user] 失败: {e}"),
+        }
+
+        for c in ["QueryMuid", "QueryAllFiles", "QueryDirectorys", "GetZoneInfo"] {
+            let p = match c {
+                "QueryAllFiles" => json!({"parentDirectoryId":"","spaceType":"0","pageNum":0,"pageSize":10,"sortRule":0}),
+                "QueryDirectorys" => json!({"spaceType":"0"}),
+                "GetZoneInfo" => json!({"appId": protocol::upload::ZONE_APP_ID}),
+                _ => json!({}),
+            };
+            match inst.dispatch(c, p, Channel::WoHome) {
+                Ok(v) => println!("[wohome] {c}: OK keys={:?}", v.as_object().map(|o| o.keys().collect::<Vec<_>>())),
+                Err(e) => println!("[wohome] {c}: {e}"),
+            }
+        }
+
+        // clientId 摆放变体（只测 QueryAllFiles）
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let payload = json!({"parentDirectoryId":"","spaceType":"0","pageNum":0,"pageSize":10,"sortRule":0});
+        let mk = |seq: i64, body: serde_json::Value| {
+            json!({
+                "header": {"key":"QueryAllFiles","resTime":t,"reqSeq":seq,"channel":"wohome",
+                           "sign": protocol::make_sign("QueryAllFiles", t, seq, "wohome", ""), "version":""},
+                "body": body,
+            })
+        };
+        let mut pa = payload.clone();
+        if let Some(o) = pa.as_object_mut() {
+            o.insert("clientId".into(), json!(inst.client_id.clone()));
+        }
+        let variants: Vec<(&str, serde_json::Value)> = vec![
+            ("A:clientId在param内", mk(1, json!({"param": protocol::encrypt(&pa.to_string(), &inst.token).unwrap(), "secret": true}))),
+            ("B:clientId在外层", mk(2, json!({"param": protocol::encrypt(&payload.to_string(), &inst.token).unwrap(), "secret": true, "clientId": inst.client_id.clone()}))),
+            ("C:不放clientId", mk(3, json!({"param": protocol::encrypt(&payload.to_string(), &inst.token).unwrap(), "secret": true}))),
+        ];
+        for (name, env) in variants {
+            match inst
+                .http
+                .post(format!("{}{}", protocol::BASE_URL, "/wohome/dispatcher"))
+                .json(&env)
+                .send()
+            {
+                Ok(r) => {
+                    let b: serde_json::Value = r.json().unwrap_or(serde_json::Value::Null);
+                    let code = b.get("RSP").and_then(|x| x.get("RSP_CODE")).and_then(|c| c.as_str()).unwrap_or("");
+                    let desc = b.get("RSP").and_then(|x| x.get("RSP_DESC")).and_then(|c| c.as_str()).unwrap_or("");
+                    println!("  {name} -> {code} {desc}");
+                }
+                Err(e) => println!("  {name} -> 请求失败 {e}"),
+            }
+        }
     }
 }
