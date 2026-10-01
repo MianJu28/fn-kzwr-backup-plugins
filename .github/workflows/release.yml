@@ -35,7 +35,9 @@ jobs:
         with:
           persist-credentials: true # 末步要提交索引
 
-      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b695e5f04bedf7 # stable
+      # ⚠️ 该 action 只有 `v1`/`master` 两个移动引用（同一 commit），没有版本 tag，
+      #    只能钉移动引用当前指向的 commit SHA；上游一改就失效（ci.yml 同）。
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1/master @2026-09-12
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -58,7 +60,7 @@ jobs:
 
       # ⚠️ 与 ci.yml 的关键差异：这里**用 cache（可写）**且前缀是 `release-`，
       #    与 PR 工作流的 `ci-` 前缀**完全不重叠** ⇒ 即使 PR 能写缓存也影响不到本工作流。
-      - uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -74,7 +76,7 @@ jobs:
       #
       # ⚠️ 缓存 key 含 arch 且前缀是 pluginbuild-（与 PR 工作流的 ci- 不重叠）。
       - name: 恢复构建产物缓存（加速用，非必需）
-        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: dist/plugins
           key: pluginartifacts-${{ matrix.arch }}-${{ github.sha }}
@@ -129,7 +131,7 @@ jobs:
           fi
 
       - name: 上传产物（供 build_index 汇总）
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: plugins-${{ matrix.arch }}
           path: |
@@ -147,7 +149,7 @@ jobs:
         with:
           persist-credentials: true
 
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist/artifacts
 

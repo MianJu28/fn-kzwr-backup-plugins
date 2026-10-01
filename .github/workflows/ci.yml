@@ -35,7 +35,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b695e5f04bedf7 # stable
+      # ⚠️ 该 action 只有 `v1` / `master` 两个移动引用（两者指向同一 commit），
+      #    **没有**版本 tag —— 所以只能钉"移动引用当前指向的 commit SHA"。
+      #    代价：上游一改就失效（正是本次 CI 红的直接原因）。
+      #    若它再次失效，改成 `@master`（可读、能自愈）并接受不可钉死。
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1/master @2026-09-12
         with:
           toolchain: stable
 
@@ -44,7 +48,10 @@ jobs:
       #
       # ⚠️ 不要用 `actions/cache` + `lookup-only: true` 实现只读：
       #    官方文档明确写 "Does not change save cache behavior"，它仍会保存。
-      - uses: actions/cache/restore@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+      # ⚠️ 不要用 v3/v4：GitHub 已把 actions/cache 的 v1/v2/v4 列为废弃版本，
+      #    runner 会直接拒绝执行（"automatically failed because it uses a
+      #    deprecated version"）。v6.1.0 是当前可用的正式 release。
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
