@@ -1,0 +1,101 @@
+{
+  "id": "wopan",
+  "name": "联通云盘（沃云盘）",
+  "version": "0.1.0",
+  "kind": "target",
+  "description": "把加密后的备份存放到联通云盘（沃云盘）。采用 H5 端协议登录，插件只接触 age 密文，明文与密钥永不离开宿主。",
+  "homepage": "https://pan.wo.cn",
+  "license": "",
+  "publisher": "",
+  "runtime": {
+    "target": "fn_kzwr_plugin_target_v1"
+  },
+  "target": {
+    "write": "push",
+    "supports_plan": false,
+    "max_parallel": 1,
+    "preferred_chunk_kib": 1024,
+    "needs_credentials": true,
+    "url_label": "备份目录（云盘内路径）",
+    "url_placeholder": "/酷族备份",
+    "url_hint": "云盘内的目录路径，备份文件会写在这里；留空则用根目录。插件只上传 age 密文，明文不会离开宿主机。",
+    "form": [
+      {
+        "key": "url",
+        "label": "备份目录",
+        "kind": "text",
+        "required": false,
+        "placeholder": "/酷族备份",
+        "hint": "云盘内的目录路径；留空则写到云盘根目录"
+      },
+      {
+        "key": "username",
+        "label": "手机号",
+        "kind": "text",
+        "required": true,
+        "placeholder": "13000000000",
+        "hint": "联通云盘账号手机号"
+      },
+      {
+        "key": "password",
+        "label": "H5 令牌（access_token）",
+        "kind": "password",
+        "required": true,
+        "placeholder": "",
+        "hint": "H5 端登录获取的 access_token（约 60 天有效）。可用插件的「短信登录」动作获取：先在插件页发送验证码，再用验证码登录取得令牌。"
+      },
+      {
+        "key": "space_type",
+        "label": "空间类型",
+        "kind": "text",
+        "required": false,
+        "placeholder": "0",
+        "hint": "0=个人云（默认），1=家庭云，4=隐私空间"
+      },
+      {
+        "type": "tips",
+        "text": "上传采用 8MB 分片直传（服务端按固定 8MB 步长拼装）。获取令牌请用插件页的短信登录动作：先发送验证码，再用验证码登录。"
+      }
+    ]
+  },
+  "ui": {
+    "title": "联通云盘（沃云盘）",
+    "blocks": [
+      {
+        "type": "tips",
+        "text": "H5 端协议。支持备份写入（8MB 分片直传）、列举、恢复、删除。令牌用宿主密钥加密后存在插件自己的数据目录，不会明文落盘。"
+      },
+      {
+        "type": "button",
+        "label": "发送短信验证码",
+        "action": "/sms/send",
+        "danger": false
+      },
+      {
+        "type": "button",
+        "label": "用验证码登录（获取并保存令牌）",
+        "action": "/sms/login",
+        "danger": false
+      },
+      {
+        "type": "button",
+        "label": "查看用户信息",
+        "action": "/user/info",
+        "danger": false
+      },
+      {
+        "type": "button",
+        "label": "查看回收站",
+        "action": "/recycle/list",
+        "danger": false
+      },
+      {
+        "type": "button",
+        "label": "清空回收站",
+        "action": "/recycle/empty",
+        "confirm": "清空回收站将永久删除其中全部文件，且不可恢复。确定继续？",
+        "danger": true
+      }
+    ]
+  }
+}
